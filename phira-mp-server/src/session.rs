@@ -469,6 +469,7 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 }
 
                 let mut map_guard = user.server.rooms.write().await;
+                user.monitor.store(false, Ordering::SeqCst);
                 let room = Arc::new(Room::new(id.clone(), Arc::downgrade(&user)));
                 match map_guard.entry(id.clone()) {
                     Entry::Vacant(entry) => {

@@ -54,6 +54,9 @@ pub struct Room {
 
 impl Room {
     pub fn new(id: RoomId, host: Weak<User>) -> Self {
+        if let Some(user) = host.upgrade() {
+            user.monitor.store(false, Ordering::SeqCst);
+        }
         Self {
             id,
             host: host.clone().into(),
@@ -192,7 +195,7 @@ impl Room {
         })
         .await;
         *user.room.write().await = None;
-        (if user.monitor.load(Ordering::SeqCst) {
+        (if user.monitor.swap(false, Ordering::SeqCst) {
             &self.monitors
         } else {
             &self.users
@@ -377,5 +380,26 @@ mod tests {
                 "iteration {i}: host rotated more than once (host={host})"
             );
         }
+    }
+
+    /// Regression test for M-3 (ported from `scratch/audit`): a user who previously joined a
+    /// room as a monitor must not retain `monitor = true` when later creating/leaving a room.
+    #[tokio::test]
+    async fn stale_monitor_flag_prevents_room_cleanup() {
+        let state = test_server_state();
+        let u = test_user(&state, 2);
+        u.monitor.store(true, Ordering::SeqCst);
+        let room = Arc::new(Room::new(room_id("r"), Arc::downgrade(&u)));
+        *u.room.write().await = Some(Arc::clone(&room));
+        assert!(
+            !u.monitor.load(Ordering::SeqCst),
+            "host monitor flag must be reset on Room::new"
+        );
+        let drop_room = room.on_user_leave(&u).await;
+        assert!(
+            drop_room,
+            "room should be dropped after its only user leaves"
+        );
+        assert!(room.users().await.is_empty());
     }
 }
