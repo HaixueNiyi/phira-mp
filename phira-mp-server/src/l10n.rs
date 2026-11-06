@@ -64,10 +64,19 @@ impl L10nLocal {
         args: Option<&'s FluentArgs<'s>>,
         errors: &mut Vec<FluentError>,
     ) -> Cow<'s, str> {
-        let id = *BUNDLES.map.get(&lang).unwrap();
+        let id = BUNDLES.map.get(&lang).copied().unwrap_or(0);
         let (id, pattern) = self.cache[id].get_or_insert(key, || {
-            if let Some((id, message)) = BUNDLES.inner[id].get_message(key).map(|msg| (id, msg)) {
-                return (id, message.value().unwrap());
+            if let Some(value) = BUNDLES.inner[id]
+                .get_message(key)
+                .and_then(|msg| msg.value())
+            {
+                return (id, value);
+            }
+            if let Some(value) = BUNDLES.inner[0]
+                .get_message(key)
+                .and_then(|msg| msg.value())
+            {
+                return (0, value);
             }
             panic!("no translation found for {key} (lang={lang})");
         });
@@ -126,12 +135,18 @@ macro_rules! tl {
 mod tests {
     use super::*;
 
-    /// Reproduction test for H-5 (ported from `scratch/audit`): when a user's language is a
-    /// valid BCP-47 tag outside `LANGS` (`en-US`, `zh-CN`, `zh-TW`), `Language::format` panics.
+    /// Regression test for H-5: when a user's language is a valid BCP-47 tag outside
+    /// `LANGS` (`en-US`, `zh-CN`, `zh-TW`), `Language::format` falls back to `en-US`.
     #[test]
-    fn l10n_unsupported_language_panics() {
-        let lang = Language("ja-JP".parse().unwrap());
-        let r = std::panic::catch_unwind(|| lang.format("join-room-locked", None).into_owned());
-        assert!(r.is_err(), "expected panic");
+    fn l10n_unsupported_language_falls_back_to_en_us() {
+        let en = Language::default()
+            .format("join-room-locked", None)
+            .into_owned();
+        assert_eq!(en, "Room is locked");
+
+        for tag in ["ja-JP", "ko-KR", "en", "fr-FR"] {
+            let lang = Language(tag.parse().unwrap());
+            assert_eq!(lang.format("join-room-locked", None), en);
+        }
     }
 }
