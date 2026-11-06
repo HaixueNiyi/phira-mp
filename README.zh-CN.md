@@ -5,7 +5,7 @@
 简体中文 | [English Version](README.md)
 ## 环境
 
-- Rust 1.70 或更高版本
+- Rust 1.88 或更高版本（工作区使用 edition 2024 和 `let` 链式条件）
 
 ## 服务端安装
 ### 对于 `Linux` 用户

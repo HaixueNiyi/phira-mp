@@ -6,7 +6,7 @@
 
 ## Environment
 
-- Rust 1.70 or later
+- Rust 1.88 or later (the workspace uses edition 2024 and `let` chains)
 
 ## Server Installation
 
