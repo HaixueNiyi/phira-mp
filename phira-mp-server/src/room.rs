@@ -4,7 +4,7 @@ use phira_mp_common::{ClientRoomState, Message, RoomId, RoomState, ServerCommand
 use rand::seq::IndexedRandom;
 use std::{
     collections::{HashMap, HashSet},
-    ops::Deref,
+    ops::DerefMut,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -226,8 +226,8 @@ impl Room {
     }
 
     pub async fn check_all_ready(&self) {
-        let guard = self.state.read().await;
-        match guard.deref() {
+        let mut guard = self.state.write().await;
+        match guard.deref_mut() {
             InternalRoomState::WaitForReady { started } => {
                 if self
                     .users()
@@ -236,14 +236,14 @@ impl Room {
                     .chain(self.monitors().await)
                     .all(|it| started.contains(&it.id))
                 {
+                    *guard = InternalRoomState::Playing {
+                        results: HashMap::new(),
+                        aborted: HashSet::new(),
+                    };
                     drop(guard);
                     info!(room = self.id.to_string(), "game start");
                     self.send(Message::StartPlaying).await;
                     self.reset_game_time().await;
-                    *self.state.write().await = InternalRoomState::Playing {
-                        results: HashMap::new(),
-                        aborted: HashSet::new(),
-                    };
                     self.on_state_change().await;
                 }
             }
@@ -256,11 +256,11 @@ impl Room {
                     .into_iter()
                     .all(|it| results.contains_key(&it.id) || aborted.contains(&it.id))
                 {
+                    *guard = InternalRoomState::SelectChart;
                     drop(guard);
                     // TODO print results
                     self.send(Message::GameEnd).await;
                     // dbg!(2);
-                    *self.state.write().await = InternalRoomState::SelectChart;
                     // dbg!(3);
                     if self.is_cycle() {
                         debug!(room = self.id.to_string(), "cycling");
@@ -285,6 +285,97 @@ impl Room {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MAX_UNAUTHENTICATED_CONNS, ServerConfig, ServerState, l10n::Language};
+    use tokio::sync::{Semaphore, mpsc};
+
+    fn test_server_state() -> Arc<ServerState> {
+        let (tx, _rx) = mpsc::channel(16);
+        std::mem::forget(_rx);
+        Arc::new(ServerState {
+            config: ServerConfig::default(),
+            http_client: reqwest::Client::new(),
+            unauth_sem: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED_CONNS)),
+            sessions: Default::default(),
+            users: Default::default(),
+            rooms: Default::default(),
+            lost_con_tx: tx,
+        })
+    }
+
+    fn test_user(state: &Arc<ServerState>, id: i32) -> Arc<User> {
+        Arc::new(User::new(
+            id,
+            format!("u{id}"),
+            Language::default(),
+            Arc::clone(state),
+        ))
+    }
+
+    fn test_record(player: i32) -> Record {
+        Record {
+            id: player,
+            player,
+            score: 1,
+            perfect: 1,
+            good: 0,
+            bad: 0,
+            miss: 0,
+            max_combo: 1,
+            accuracy: 1.0,
+            full_combo: true,
+            std: 0.0,
+            std_score: 0.0,
+        }
+    }
+
+    fn room_id(s: &str) -> RoomId {
+        s.to_owned().try_into().unwrap()
+    }
+
+    /// Regression test for M-1 (ported from `scratch/audit`): concurrent `check_all_ready()`
+    /// calls must not perform duplicate `Playing -> SelectChart` transitions (which previously
+    /// rotated the host more than once when `cycle` was enabled).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn check_all_ready_does_not_double_transition() {
+        let state = test_server_state();
+        for i in 0..300 {
+            let (a, b, c) = (
+                test_user(&state, 1),
+                test_user(&state, 2),
+                test_user(&state, 3),
+            );
+            let room = Arc::new(Room::new(room_id(&format!("r{i}")), Arc::downgrade(&a)));
+            assert!(room.add_user(Arc::downgrade(&b), false).await);
+            assert!(room.add_user(Arc::downgrade(&c), false).await);
+            room.cycle.store(true, Ordering::SeqCst);
+            *room.state.write().await = InternalRoomState::Playing {
+                results: [1, 2, 3]
+                    .into_iter()
+                    .map(|id| (id, test_record(id)))
+                    .collect(),
+                aborted: HashSet::new(),
+            };
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let r = Arc::clone(&room);
+                    tokio::spawn(async move { r.check_all_ready().await })
+                })
+                .collect();
+            for h in handles {
+                h.await.unwrap();
+            }
+            let host = room.host.read().await.upgrade().unwrap().id;
+            assert_eq!(
+                host, 2,
+                "iteration {i}: host rotated more than once (host={host})"
+            );
         }
     }
 }
