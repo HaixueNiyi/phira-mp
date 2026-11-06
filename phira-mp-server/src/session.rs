@@ -493,7 +493,7 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                         .users()
                         .await
                         .into_iter()
-                        .chain(room.monitors().await.into_iter())
+                        .chain(room.monitors().await)
                         .map(|it| it.to_info())
                         .collect(),
                     live: room.is_live(),

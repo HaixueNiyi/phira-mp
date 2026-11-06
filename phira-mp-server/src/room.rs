@@ -163,12 +163,7 @@ impl Room {
 
     pub async fn broadcast(&self, cmd: ServerCommand) {
         debug!("broadcast {cmd:?}");
-        for session in self
-            .users()
-            .await
-            .into_iter()
-            .chain(self.monitors().await.into_iter())
-        {
+        for session in self.users().await.into_iter().chain(self.monitors().await) {
             session.try_send(cmd.clone()).await;
         }
     }
@@ -238,7 +233,7 @@ impl Room {
                     .users()
                     .await
                     .into_iter()
-                    .chain(self.monitors().await.into_iter())
+                    .chain(self.monitors().await)
                     .all(|it| started.contains(&it.id))
                 {
                     drop(guard);
@@ -252,6 +247,8 @@ impl Room {
                     self.on_state_change().await;
                 }
             }
+            // clippy suggests folding the `if` into a match guard, but a guard cannot `.await`.
+            #[allow(clippy::collapsible_match)]
             InternalRoomState::Playing { results, aborted } => {
                 if self
                     .users()
