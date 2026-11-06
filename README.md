@@ -43,6 +43,8 @@ The port can also be specified via parameters:
 RUST_LOG=info target/release/phira-mp-server --port 8080
 ```
 
+Log files are written to `./log/` (hourly rotation). Use `--log-level <off|error|warn|info|debug|trace>` (default `debug`) to choose what is written to the files, and `--log-max-files <N>` (default `168`, i.e. one week; `0` keeps everything) to limit how many rotated files are kept.
+
 ### For docker
 
 1. Create Dockerfile

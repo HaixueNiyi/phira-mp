@@ -20,7 +20,7 @@ use std::{
     path::Path,
 };
 use tokio::{net::TcpListener, sync::RwLock};
-use tracing::warn;
+use tracing::{metadata::LevelFilter, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use uuid::Uuid;
 
@@ -39,8 +39,10 @@ fn vacant_entry<V>(map: &mut HashMap<Uuid, V>) -> VacantEntry<'_, Uuid, V> {
     }
 }
 
-pub fn init_log(file: &str) -> Result<WorkerGuard> {
-    use tracing::{Level, metadata::LevelFilter};
+/// `max_files == 0` keeps every rotated log file.
+pub fn init_log(file: &str, level: LevelFilter, max_files: usize) -> Result<WorkerGuard> {
+    use tracing::Level;
+    use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_log::LogTracer;
     use tracing_subscriber::{EnvFilter, filter, fmt, prelude::*};
 
@@ -55,15 +57,16 @@ pub fn init_log(file: &str) -> Result<WorkerGuard> {
 
     LogTracer::init()?;
 
-    let (non_blocking, guard) =
-        tracing_appender::non_blocking(tracing_appender::rolling::hourly(log_dir, file));
+    let mut appender = RollingFileAppender::builder()
+        .rotation(Rotation::HOURLY)
+        .filename_prefix(file);
+    if max_files > 0 {
+        appender = appender.max_log_files(max_files);
+    }
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender.build(log_dir)?);
 
     let subscriber = tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .with_writer(non_blocking)
-                .with_filter(LevelFilter::DEBUG),
-        )
+        .with(fmt::layer().with_writer(non_blocking).with_filter(level))
         .with(
             fmt::layer()
                 .with_writer(std::io::stdout)
@@ -92,13 +95,27 @@ struct Args {
         help = "Specify the port number to use for the server"
     )]
     port: u16,
+
+    #[clap(
+        long,
+        default_value_t = LevelFilter::DEBUG,
+        help = "Maximum level written to the log file (off, error, warn, info, debug, trace)"
+    )]
+    log_level: LevelFilter,
+
+    #[clap(
+        long,
+        default_value_t = 168,
+        help = "Number of hourly log files to keep (0 = keep all)"
+    )]
+    log_max_files: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _guard = init_log("phira-mp")?;
-
     let args = Args::parse();
+    let _guard = init_log("phira-mp", args.log_level, args.log_max_files)?;
+
     let port = args.port;
     let addrs: &[SocketAddr] = &[SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)];
 
@@ -113,5 +130,37 @@ async fn main() -> Result<()> {
         if let Err(err) = listener.accept().await {
             warn!("failed to accept: {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_args_defaults_keep_previous_behaviour() {
+        let args = Args::try_parse_from(["phira-mp-server"]).unwrap();
+        assert_eq!(args.port, 12346);
+        assert_eq!(args.log_level, LevelFilter::DEBUG);
+        assert_eq!(args.log_max_files, 168);
+    }
+
+    #[test]
+    fn log_args_are_configurable() {
+        let args = Args::try_parse_from([
+            "phira-mp-server",
+            "--log-level",
+            "warn",
+            "--log-max-files",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(args.log_level, LevelFilter::WARN);
+        assert_eq!(args.log_max_files, 0);
+    }
+
+    #[test]
+    fn invalid_log_level_is_rejected() {
+        assert!(Args::try_parse_from(["phira-mp-server", "--log-level", "loud"]).is_err());
     }
 }

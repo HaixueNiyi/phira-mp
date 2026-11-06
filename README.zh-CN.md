@@ -40,6 +40,8 @@ RUST_LOG=info target/release/phira-mp-server
 RUST_LOG=info target/release/phira-mp-server --port 8080
 ```
 
+日志文件写入 `./log/`（按小时滚动）。可用 `--log-level <off|error|warn|info|debug|trace>`（默认 `debug`）控制写入文件的日志级别，用 `--log-max-files <N>`（默认 `168`，即一周；`0` 表示不清理）限制保留的日志文件数量。
+
 ### For docker
 
 1. 创建 Dockerfile
