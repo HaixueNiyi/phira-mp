@@ -121,3 +121,68 @@ impl Drop for Server {
         self.lost_con_handle.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{net::SocketAddr, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        time::timeout,
+    };
+
+    /// Starts a `Server` on an ephemeral localhost port, driving `accept()` in a loop like `main`.
+    async fn start_server() -> (SocketAddr, Arc<Server>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Arc::new(Server::from(listener));
+        let server_clone = Arc::clone(&server);
+        tokio::spawn(async move {
+            loop {
+                let _ = server_clone.accept().await;
+            }
+        });
+        (addr, server)
+    }
+
+    /// Sends protocol version 1 + framed `ClientCommand::Ping` (`[1, 0]`) and expects
+    /// framed `ServerCommand::Pong` (`[1, 0]`) within `wait`.
+    async fn ping_roundtrip(addr: SocketAddr, wait: Duration) -> bool {
+        let Ok(Ok(mut conn)) = timeout(wait, TcpStream::connect(addr)).await else {
+            return false;
+        };
+        if conn.write_all(&[1, 1, 0]).await.is_err() {
+            return false;
+        }
+        let mut resp = [0u8; 2];
+        matches!(timeout(wait, conn.read_exact(&mut resp)).await, Ok(Ok(_)) if resp == [1, 0])
+    }
+
+    /// Reproduction test for C-1 (ported from `scratch/poc_accept_block.py`):
+    /// an idle unauthenticated TCP connection (either before or after sending the version byte)
+    /// must not block `accept()` or hold the global `sessions` write lock.
+    #[tokio::test]
+    async fn idle_unauthenticated_connection_does_not_block_accept() {
+        let (addr, server) = start_server().await;
+
+        // Attacker 1: connects and sends nothing at all (no version byte).
+        let _attacker_no_version = TcpStream::connect(addr).await.unwrap();
+        // Attacker 2: connects, sends only the version byte, and never authenticates.
+        let mut attacker_no_auth = TcpStream::connect(addr).await.unwrap();
+        attacker_no_auth.write_all(&[1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Subsequent client must still be accepted and served promptly.
+        assert!(
+            ping_roundtrip(addr, Duration::from_millis(500)).await,
+            "victim client timed out waiting for Pong while idle connections were open"
+        );
+
+        // Global `sessions` write lock must not be held by unauthenticated connections.
+        assert!(
+            server.state.sessions.try_write().is_ok(),
+            "sessions write lock is held while waiting for unauthenticated peer"
+        );
+    }
+}

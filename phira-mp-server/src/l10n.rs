@@ -121,3 +121,17 @@ macro_rules! tl {
         $crate::l10n::LANGUAGE.with(|l| l.format($key, Some(&fluent::fluent_args![$($attr => $value), *])).into_owned())
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduction test for H-5 (ported from `scratch/audit`): when a user's language is a
+    /// valid BCP-47 tag outside `LANGS` (`en-US`, `zh-CN`, `zh-TW`), `Language::format` panics.
+    #[test]
+    fn l10n_unsupported_language_panics() {
+        let lang = Language("ja-JP".parse().unwrap());
+        let r = std::panic::catch_unwind(|| lang.format("join-room-locked", None).into_owned());
+        assert!(r.is_err(), "expected panic");
+    }
+}
