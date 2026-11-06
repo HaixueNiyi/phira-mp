@@ -177,7 +177,7 @@ impl Session {
                                         if token.len() > 32 {
                                             bail!("invalid token");
                                         }
-                                        debug!("session {id}: authenticate {token}");
+                                        debug!("session {id}: authenticate");
                                         #[derive(Debug, Deserialize)]
                                         struct UserInfo {
                                             id: i32,

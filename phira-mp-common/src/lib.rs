@@ -130,7 +130,9 @@ where
                     let payload: R = match decode_packet(&buffer) {
                         Ok(val) => val,
                         Err(err) => {
-                            warn!("invalid packet: {err:?} {buffer:?}");
+                            // Do not dump the raw bytes: a malformed `Authenticate` packet
+                            // would leak (part of) the bearer token into the logs.
+                            warn!("invalid packet ({} bytes): {err:?}", buffer.len());
                             break;
                         }
                     };
