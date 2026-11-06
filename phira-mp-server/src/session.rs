@@ -80,7 +80,8 @@ impl User {
     }
 
     pub async fn try_send(&self, cmd: ServerCommand) {
-        if let Some(session) = self.session.read().await.as_ref().and_then(Weak::upgrade) {
+        let session = self.session.read().await.as_ref().and_then(Weak::upgrade);
+        if let Some(session) = session {
             session.try_send(cmd).await;
         } else {
             warn!("sending {cmd:?} to dangling user {}", self.id);
@@ -128,6 +129,7 @@ pub struct Session {
     pub stream: Stream<ServerCommand, ClientCommand>,
     pub user: Arc<User>,
 
+    panicked: Arc<AtomicBool>,
     monitor_task_handle: JoinHandle<()>,
 }
 
@@ -138,6 +140,7 @@ impl Session {
         let this_inited = Arc::new(Notify::new());
         let (tx, rx) = oneshot::channel::<Arc<User>>();
         let last_recv: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+        let panicked = Arc::new(AtomicBool::new(false));
         let stream = time::timeout(
             HEARTBEAT_DISCONNECT_TIMEOUT,
             Stream::<ServerCommand, ClientCommand>::new(
@@ -150,7 +153,7 @@ impl Session {
                     let server = Arc::clone(&server);
                     let last_recv = Arc::clone(&last_recv);
                     let waiting_for_authenticate = Arc::new(AtomicBool::new(true));
-                    let panicked = Arc::new(AtomicBool::new(false));
+                    let panicked = Arc::clone(&panicked);
                     move |send_tx, cmd| {
                         let this = Arc::clone(&this);
                         let this_inited = Arc::clone(&this_inited);
@@ -169,7 +172,7 @@ impl Session {
                                 return;
                             }
                             if matches!(cmd, ClientCommand::Ping) {
-                                let _ = send_tx.send(ServerCommand::Pong).await;
+                                let _ = send_tx.try_send(ServerCommand::Pong);
                                 return;
                             }
                             if waiting_for_authenticate.load(Ordering::SeqCst) {
@@ -250,11 +253,12 @@ impl Session {
                                     .await;
                                     if let Err(err) = res {
                                         warn!("failed to authenticate: {err:?}");
-                                        let _ = send_tx
-                                            .send(ServerCommand::Authenticate(Err(err.to_string())))
-                                            .await;
-                                        panicked.store(true, Ordering::SeqCst);
-                                        if let Err(err) = server.lost_con_tx.send(id).await {
+                                        let _ = send_tx.try_send(ServerCommand::Authenticate(Err(
+                                            err.to_string(),
+                                        )));
+                                        if !panicked.swap(true, Ordering::SeqCst)
+                                            && let Err(err) = server.lost_con_tx.send(id).await
+                                        {
                                             error!("failed to mark lost connection ({id}): {err:?}");
                                         }
                                     } else {
@@ -263,12 +267,10 @@ impl Session {
                                             Some(room) => Some(room.client_state(user).await),
                                             None => None,
                                         };
-                                        let _ = send_tx
-                                            .send(ServerCommand::Authenticate(Ok((
-                                                user.to_info(),
-                                                room_state,
-                                            ))))
-                                            .await;
+                                        let _ = send_tx.try_send(ServerCommand::Authenticate(Ok((
+                                            user.to_info(),
+                                            room_state,
+                                        ))));
                                         waiting_for_authenticate.store(false, Ordering::SeqCst);
                                     }
                                     return;
@@ -281,13 +283,14 @@ impl Session {
                             if let Some(resp) = LANGUAGE
                                 .scope(Arc::new(user.lang.clone()), process(user, cmd))
                                 .await
-                                && let Err(err) = send_tx.send(resp).await
+                                && let Err(err) = send_tx.try_send(resp)
                             {
                                 error!(
                                     "failed to handle message, aborting connection {id}: {err:?}",
                                 );
-                                panicked.store(true, Ordering::SeqCst);
-                                if let Err(err) = server.lost_con_tx.send(id).await {
+                                if !panicked.swap(true, Ordering::SeqCst)
+                                    && let Err(err) = server.lost_con_tx.send(id).await
+                                {
                                     error!("failed to mark lost connection ({id}): {err:?}");
                                 }
                             }
@@ -329,6 +332,7 @@ impl Session {
             stream,
             user,
 
+            panicked,
             monitor_task_handle,
         });
         let _ = this.set(Arc::clone(&res));
@@ -345,8 +349,21 @@ impl Session {
     }
 
     pub async fn try_send(&self, cmd: ServerCommand) {
-        if let Err(err) = self.stream.send(cmd).await {
-            error!("failed to deliver command to {}: {err:?}", self.id);
+        if let Err(err) = self.stream.try_send(cmd) {
+            error!(
+                "failed to deliver command to {}, disconnecting: {err:?}",
+                self.id
+            );
+            if !self.panicked.swap(true, Ordering::SeqCst) {
+                self.monitor_task_handle.abort();
+                let lost_con_tx = self.user.server.lost_con_tx.clone();
+                let id = self.id;
+                tokio::spawn(async move {
+                    if let Err(err) = lost_con_tx.send(id).await {
+                        error!("failed to mark lost connection ({id}): {err:?}");
+                    }
+                });
+            }
         }
     }
 }
@@ -733,5 +750,74 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
             .await;
             Some(ServerCommand::Abort(err_to_str(res)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MAX_UNAUTHENTICATED_CONNS, ServerConfig};
+    use tokio::{
+        net::TcpListener,
+        sync::{Semaphore, mpsc},
+    };
+
+    #[tokio::test]
+    async fn full_send_queue_kicks_session_without_blocking() {
+        let (lost_con_tx, mut lost_con_rx) = mpsc::channel(16);
+        let state = Arc::new(ServerState {
+            config: ServerConfig::default(),
+            http_client: reqwest::Client::new(),
+            unauth_sem: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED_CONNS)),
+            sessions: Default::default(),
+            users: Default::default(),
+            rooms: Default::default(),
+            lost_con_tx,
+        });
+        let user = Arc::new(User::new(
+            1,
+            "alice".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_handle = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            sock // never reads
+        });
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let stream =
+            Stream::<ServerCommand, ClientCommand>::new(Some(1), sock, Box::new(|_, _| async {}))
+                .await
+                .unwrap();
+        let _peer = peer_handle.await.unwrap();
+
+        let id = Uuid::new_v4();
+        let session = Arc::new(Session {
+            id,
+            stream,
+            user: Arc::clone(&user),
+            panicked: Arc::new(AtomicBool::new(false)),
+            monitor_task_handle: tokio::spawn(async {}),
+        });
+        user.set_session(Arc::downgrade(&session)).await;
+
+        let big = "x".repeat(60_000);
+        for _ in 0..2_000 {
+            session
+                .try_send(ServerCommand::Message(Message::Chat {
+                    user: 1,
+                    content: big.clone(),
+                }))
+                .await;
+        }
+
+        let kicked_id = time::timeout(Duration::from_millis(500), lost_con_rx.recv())
+            .await
+            .expect("timed out waiting for slow session to be marked lost")
+            .expect("lost_con channel closed");
+        assert_eq!(kicked_id, id);
     }
 }

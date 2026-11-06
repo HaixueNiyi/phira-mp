@@ -11,12 +11,14 @@ use tokio::{
     net::TcpStream,
     sync::mpsc,
     task::JoinHandle,
+    time,
 };
 use tracing::{error, trace, warn};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HEARTBEAT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn encode_packet(payload: &impl BinaryData, vec: &mut Vec<u8>) {
     BinaryWriter::new(vec).write(payload).unwrap();
@@ -86,14 +88,22 @@ where
                         }
                     }
 
-                    if let Err(err) = async {
+                    match time::timeout(SEND_TIMEOUT, async {
                         write.write_all(&len_buf[..n]).await?;
                         write.write_all(&buffer).await?;
                         Ok::<_, Error>(())
-                    }
+                    })
                     .await
                     {
-                        error!("failed to send: {err:?}");
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            error!("failed to send: {err:?}");
+                            break;
+                        }
+                        Err(_) => {
+                            error!("send timed out after {SEND_TIMEOUT:?}");
+                            break;
+                        }
                     }
                 }
             }
@@ -164,6 +174,11 @@ where
         Ok(())
     }
 
+    pub fn try_send(&self, payload: S) -> Result<()> {
+        self.send_tx.try_send(payload)?;
+        Ok(())
+    }
+
     pub fn blocking_send(&self, payload: S) -> Result<()> {
         self.send_tx.blocking_send(payload)?;
         Ok(())
@@ -174,5 +189,44 @@ impl<S, R> Drop for Stream<S, R> {
     fn drop(&mut self) {
         self.send_task_handle.abort();
         self.recv_task_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn try_send_fails_immediately_when_queue_is_full() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            sock
+        });
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let stream: Stream<ServerCommand, ClientCommand> =
+            Stream::new(Some(1), sock, Box::new(|_, _| async {}))
+                .await
+                .unwrap();
+        let _peer = peer.await.unwrap();
+
+        let big = "x".repeat(60_000);
+        let mut hit_full = false;
+        for _ in 0..5_000 {
+            let msg = ServerCommand::Message(Message::Chat {
+                user: 1,
+                content: big.clone(),
+            });
+            if stream.try_send(msg).is_err() {
+                hit_full = true;
+                break;
+            }
+        }
+        assert!(
+            hit_full,
+            "expected try_send to fail once the send queue and socket buffer filled"
+        );
     }
 }
