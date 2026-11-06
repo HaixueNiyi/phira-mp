@@ -18,7 +18,7 @@ use tracing::{error, trace, warn};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HEARTBEAT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn encode_packet(payload: &impl BinaryData, vec: &mut Vec<u8>) {
     BinaryWriter::new(vec).write(payload).unwrap();
