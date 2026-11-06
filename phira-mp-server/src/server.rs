@@ -2,10 +2,17 @@ use crate::{IdMap, Room, SafeMap, Session, User, vacant_entry};
 use anyhow::Result;
 use phira_mp_common::RoomId;
 use serde::Deserialize;
-use std::{fs::File, sync::Arc};
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use std::{fs::File, sync::Arc, time::Duration};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub const MAX_UNAUTHENTICATED_CONNS: usize = 256;
+pub const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 pub struct Chart {
@@ -41,6 +48,8 @@ pub struct Record {
 
 pub struct ServerState {
     pub config: ServerConfig,
+    pub http_client: reqwest::Client,
+    pub unauth_sem: Arc<Semaphore>,
     pub sessions: IdMap<Arc<Session>>,
     pub users: SafeMap<i32, Arc<User>>,
 
@@ -62,8 +71,15 @@ impl From<TcpListener> for Server {
             .ok()
             .and_then(|f| serde_yaml::from_reader(f).ok())
             .unwrap_or_default();
+        let http_client = reqwest::Client::builder()
+            .timeout(AUTH_HTTP_TIMEOUT)
+            .connect_timeout(AUTH_HTTP_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client");
         let state = Arc::new(ServerState {
             config,
+            http_client,
+            unauth_sem: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED_CONNS)),
             sessions: IdMap::default(),
             users: SafeMap::default(),
 
@@ -103,8 +119,13 @@ impl From<TcpListener> for Server {
 impl Server {
     pub async fn accept(&self) -> Result<()> {
         let (stream, addr) = self.listener.accept().await?;
+        let Ok(permit) = Arc::clone(&self.state.unauth_sem).try_acquire_owned() else {
+            warn!("rejecting connection from {addr}: too many unauthenticated connections");
+            return Ok(());
+        };
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
+            let _permit = permit;
             let id = {
                 let mut guard = state.sessions.write().await;
                 *vacant_entry(&mut guard).key()
@@ -194,6 +215,33 @@ mod tests {
         assert!(
             server.state.sessions.try_write().is_ok(),
             "sessions write lock is held while waiting for unauthenticated peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connection_cap_rejects_excess_and_recovers() {
+        let (addr, server) = start_server().await;
+
+        // Exhaust all unauthenticated slots via the semaphore.
+        let permits = Arc::clone(&server.state.unauth_sem)
+            .acquire_many_owned(MAX_UNAUTHENTICATED_CONNS as u32)
+            .await
+            .unwrap();
+
+        // Any new connection while at the cap must be rejected (dropped -> EOF).
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = timeout(Duration::from_millis(500), excess.read(&mut buf))
+            .await
+            .expect("excess connection was not closed promptly")
+            .unwrap();
+        assert_eq!(n, 0, "expected immediate EOF when unauth cap is reached");
+
+        // Releasing the permits allows subsequent clients to connect and be served.
+        drop(permits);
+        assert!(
+            ping_roundtrip(addr, Duration::from_millis(500)).await,
+            "client was not served after unauthenticated slots were freed"
         );
     }
 }

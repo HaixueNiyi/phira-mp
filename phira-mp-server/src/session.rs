@@ -191,7 +191,8 @@ impl Session {
                                                 language: String,
                                             }
                                             let resp: Result<UserInfo> = async {
-                                                Ok(reqwest::Client::new()
+                                                Ok(server
+                                                    .http_client
                                                     .get(format!("{HOST}/me"))
                                                     .header(
                                                         reqwest::header::AUTHORIZATION,
