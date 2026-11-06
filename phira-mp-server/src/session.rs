@@ -110,14 +110,14 @@ impl User {
         tokio::spawn(async move {
             time::sleep(Duration::from_secs(10)).await;
             if Arc::strong_count(&dangle_mark) > 1 {
+                self.server.users.write().await.remove(&self.id);
                 let guard = self.room.read().await;
                 let room = guard.as_ref().map(Arc::clone);
                 drop(guard);
-                if let Some(room) = room {
-                    self.server.users.write().await.remove(&self.id);
-                    if room.on_user_leave(&self).await {
-                        self.server.rooms.write().await.remove(&room.id);
-                    }
+                if let Some(room) = room
+                    && room.on_user_leave(&self).await
+                {
+                    self.server.rooms.write().await.remove(&room.id);
                 }
             }
         });
@@ -820,5 +820,34 @@ mod tests {
             .expect("timed out waiting for slow session to be marked lost")
             .expect("lost_con channel closed");
         assert_eq!(kicked_id, id);
+    }
+
+    /// Regression test for M-4 (ported from `scratch/audit`): a dangling user who is not in any
+    /// room must still be evicted from `server.users` once the dangle timeout elapses.
+    #[tokio::test]
+    async fn dangling_user_without_room_is_evicted() {
+        let (lost_con_tx, _lost_con_rx) = mpsc::channel(16);
+        let state = Arc::new(ServerState {
+            config: ServerConfig::default(),
+            http_client: reqwest::Client::new(),
+            unauth_sem: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED_CONNS)),
+            sessions: Default::default(),
+            users: Default::default(),
+            rooms: Default::default(),
+            lost_con_tx,
+        });
+        let u = Arc::new(User::new(
+            42,
+            "u42".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        state.users.write().await.insert(42, Arc::clone(&u));
+        u.dangle().await;
+        time::sleep(Duration::from_secs(11)).await;
+        assert!(
+            !state.users.read().await.contains_key(&42),
+            "dangling user without room should be removed from server.users"
+        );
     }
 }
