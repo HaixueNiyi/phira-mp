@@ -103,15 +103,26 @@ impl From<TcpListener> for Server {
 impl Server {
     pub async fn accept(&self) -> Result<()> {
         let (stream, addr) = self.listener.accept().await?;
-        let mut guard = self.state.sessions.write().await;
-        let entry = vacant_entry(&mut guard);
-        let session = Session::new(*entry.key(), stream, Arc::clone(&self.state)).await?;
-        info!(
-            "received connections from {addr} ({}), version: {}",
-            session.id,
-            session.version()
-        );
-        entry.insert(session);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let id = {
+                let mut guard = state.sessions.write().await;
+                *vacant_entry(&mut guard).key()
+            };
+            match Session::new(id, stream, Arc::clone(&state)).await {
+                Ok(session) => {
+                    info!(
+                        "received connections from {addr} ({}), version: {}",
+                        session.id,
+                        session.version()
+                    );
+                    state.sessions.write().await.insert(session.id, session);
+                }
+                Err(err) => {
+                    warn!("failed to accept connection from {addr} ({id}): {err:?}");
+                }
+            }
+        });
         Ok(())
     }
 }
