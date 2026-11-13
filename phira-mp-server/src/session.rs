@@ -1,12 +1,12 @@
 use crate::{
-    Chart, InternalRoomState, Record, Room, ServerState,
+    AddUserResult, Chart, InternalRoomState, Record, Room, ServerState,
     l10n::{LANGUAGE, Language},
     tl,
 };
 use anyhow::{Result, anyhow, bail};
 use phira_mp_common::{
-    ClientCommand, HEARTBEAT_DISCONNECT_TIMEOUT, JoinRoomResponse, Message, ServerCommand, Stream,
-    UserInfo,
+    ClientCommand, HEARTBEAT_DISCONNECT_TIMEOUT, JoinRoomResponse, JudgeEvent, MAX_PACKET_SIZE,
+    Message, ServerCommand, Stream, TouchFrame, UserInfo,
 };
 use serde::Deserialize;
 use std::{
@@ -31,6 +31,35 @@ use uuid::Uuid;
 
 const HOST: &str = "https://phira.5wyxi.com";
 
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn take(&mut self, capacity: f64, refill_per_sec: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct User {
     pub id: i32,
     pub name: String,
@@ -44,6 +73,10 @@ pub struct User {
     pub game_time: AtomicU32,
 
     pub dangle_mark: Mutex<Option<Arc<()>>>,
+
+    chat_limit: std::sync::Mutex<TokenBucket>,
+    room_op_limit: std::sync::Mutex<TokenBucket>,
+    live_frame_limit: std::sync::Mutex<TokenBucket>,
 }
 
 impl User {
@@ -61,6 +94,10 @@ impl User {
             game_time: AtomicU32::default(),
 
             dangle_mark: Mutex::default(),
+
+            chat_limit: std::sync::Mutex::new(TokenBucket::new(10.0)),
+            room_op_limit: std::sync::Mutex::new(TokenBucket::new(15.0)),
+            live_frame_limit: std::sync::Mutex::new(TokenBucket::new(300.0)),
         }
     }
 
@@ -590,6 +627,70 @@ impl Drop for Session {
     }
 }
 
+fn estimate_touches_bytes(frames: &[TouchFrame]) -> usize {
+    let mut total = 16usize;
+    for frame in frames {
+        total = total
+            .saturating_add(9)
+            .saturating_add(frame.points.len().saturating_mul(5));
+        if total > MAX_PACKET_SIZE {
+            return total;
+        }
+    }
+    total
+}
+
+fn estimate_judges_bytes(judges: &[JudgeEvent]) -> usize {
+    16usize.saturating_add(judges.len().saturating_mul(13))
+}
+
+async fn apply_played_record(user: &User, room: &Room, res: Record) -> Result<()> {
+    if user.monitor.load(Ordering::SeqCst) {
+        bail!("invalid state");
+    }
+    if res.player != user.id {
+        bail!("invalid record");
+    }
+    let (score, accuracy, full_combo) = {
+        let mut guard = room.state.write().await;
+        let InternalRoomState::Playing { results, aborted } = guard.deref_mut() else {
+            bail!("invalid state");
+        };
+        if !room.contains_user(user.id).await {
+            bail!("no room");
+        }
+        if aborted.contains(&user.id) {
+            bail!("aborted");
+        }
+        if results.contains_key(&user.id) {
+            bail!("already uploaded");
+        }
+        if !room.used_records.lock().await.insert(res.id) {
+            bail!("duplicate record");
+        }
+        let summary = (res.score, res.accuracy, res.full_combo);
+        results.insert(user.id, res);
+        summary
+    };
+    debug!(
+        room = room.id.to_string(),
+        user = user.id,
+        score,
+        accuracy,
+        full_combo,
+        "user played"
+    );
+    room.send(Message::Played {
+        user: user.id,
+        score,
+        accuracy,
+        full_combo,
+    })
+    .await;
+    room.check_all_ready().await;
+    Ok(())
+}
+
 async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
     #[inline]
     fn err_to_str<T>(result: Result<T>) -> Result<T, String> {
@@ -615,18 +716,6 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 .map(Arc::clone)
                 .ok_or_else(|| anyhow!("no room"))?;
         };
-        ($d:ident, $($pt:tt)*) => {
-            let $d = user
-                .room
-                .read()
-                .await
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| anyhow!("no room"))?;
-            if !matches!(&*$d.state.read().await, $($pt)*) {
-                bail!("invalid state");
-            }
-        };
     }
     match cmd {
         ClientCommand::Ping => unreachable!(),
@@ -636,6 +725,9 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         ClientCommand::Chat { message } => {
             let res: Result<()> = async move {
                 get_room!(room);
+                if !user.chat_limit.lock().unwrap().take(10.0, 5.0) {
+                    bail!("rate limited");
+                }
                 room.send_as(&user, message.into_inner()).await;
                 Ok(())
             }
@@ -644,60 +736,84 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         }
         ClientCommand::Touches { frames } => {
             get_room!(~ room);
-            if room.is_live() {
+            if user.monitor.load(Ordering::SeqCst) {
+                warn!("monitor {} attempted to send touch events", user.id);
+                return None;
+            }
+            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0) {
+                warn!("rate limiting touch events from {}", user.id);
+                return None;
+            }
+            if estimate_touches_bytes(&frames) > MAX_PACKET_SIZE - 16 {
+                warn!("dropping oversized touch frame batch from {}", user.id);
+                return None;
+            }
+            if room.is_live()
+                && matches!(*room.state.read().await, InternalRoomState::Playing { .. })
+            {
                 debug!("received {} touch events from {}", frames.len(), user.id);
                 if let Some(frame) = frames.last() {
                     user.game_time.store(frame.time.to_bits(), Ordering::SeqCst);
                 }
-                tokio::spawn(async move {
-                    room.broadcast_monitors(ServerCommand::Touches {
-                        player: user.id,
-                        frames,
-                    })
-                    .await;
+                room.queue_monitor(ServerCommand::Touches {
+                    player: user.id,
+                    frames,
                 });
             } else {
-                warn!("received touch events in non-live mode");
+                warn!("received touch events in non-live or non-playing mode");
             }
             None
         }
         ClientCommand::Judges { judges } => {
             get_room!(~ room);
-            if room.is_live() {
+            if user.monitor.load(Ordering::SeqCst) {
+                warn!("monitor {} attempted to send judge events", user.id);
+                return None;
+            }
+            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0) {
+                warn!("rate limiting judge events from {}", user.id);
+                return None;
+            }
+            if estimate_judges_bytes(&judges) > MAX_PACKET_SIZE - 16 {
+                warn!("dropping oversized judge batch from {}", user.id);
+                return None;
+            }
+            if room.is_live()
+                && matches!(*room.state.read().await, InternalRoomState::Playing { .. })
+            {
                 debug!("received {} judge events from {}", judges.len(), user.id);
-                tokio::spawn(async move {
-                    room.broadcast_monitors(ServerCommand::Judges {
-                        player: user.id,
-                        judges,
-                    })
-                    .await;
+                room.queue_monitor(ServerCommand::Judges {
+                    player: user.id,
+                    judges,
                 });
             } else {
-                warn!("received judge events in non-live mode");
+                warn!("received judge events in non-live or non-playing mode");
             }
             None
         }
         ClientCommand::CreateRoom { id } => {
             let res: Result<()> = async move {
+                if !user.room_op_limit.lock().unwrap().take(15.0, 5.0) {
+                    bail!("rate limited");
+                }
                 let mut room_guard = user.room.write().await;
                 if room_guard.is_some() {
                     bail!("already in room");
                 }
 
-                let mut map_guard = user.server.rooms.write().await;
-                user.monitor.store(false, Ordering::SeqCst);
-                let room = Arc::new(Room::new(id.clone(), Arc::downgrade(&user)));
-                match map_guard.entry(id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Arc::clone(&room));
-                    }
-                    Entry::Occupied(_) => {
+                let room = {
+                    let mut map_guard = user.server.rooms.write().await;
+                    if map_guard.contains_key(&id) {
                         bail!(tl!("create-id-occupied"));
                     }
-                }
+                    user.monitor.store(false, Ordering::SeqCst);
+                    let room = Arc::new(Room::new(id.clone(), Arc::downgrade(&user)));
+                    map_guard.insert(id.clone(), Arc::clone(&room));
+                    room
+                };
+                *room_guard = Some(Arc::clone(&room));
+                drop(room_guard);
                 room.send(Message::CreateRoom { user: user.id }).await;
-                drop(map_guard);
-                *room_guard = Some(room);
 
                 info!(user = user.id, room = id.to_string(), "user create room");
                 Ok(())
@@ -706,26 +822,46 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
             Some(ServerCommand::CreateRoom(err_to_str(res)))
         }
         ClientCommand::JoinRoom { id, monitor } => {
-            let res: Result<JoinRoomResponse> = async move {
+            let res: Result<()> = async move {
+                if !user.room_op_limit.lock().unwrap().take(15.0, 5.0) {
+                    bail!("rate limited");
+                }
                 let mut room_guard = user.room.write().await;
                 if room_guard.is_some() {
                     bail!("already in room");
                 }
                 let room = user.server.rooms.read().await.get(&id).map(Arc::clone);
                 let Some(room) = room else {
-                    bail!("room not found")
+                    bail!("room not found");
                 };
+                let member_guard = room.membership_lock.lock().await;
+                let still_active = user
+                    .server
+                    .rooms
+                    .read()
+                    .await
+                    .get(&id)
+                    .is_some_and(|r| Arc::ptr_eq(r, &room));
+                if !still_active || room.is_dropped() {
+                    bail!("room not found");
+                }
                 if room.locked.load(Ordering::SeqCst) {
                     bail!(tl!("join-room-locked"));
-                }
-                if !matches!(*room.state.read().await, InternalRoomState::SelectChart) {
-                    bail!(tl!("join-game-ongoing"));
                 }
                 if monitor && !user.can_monitor() {
                     bail!(tl!("join-cant-monitor"));
                 }
-                if !room.add_user(Arc::downgrade(&user), monitor).await {
-                    bail!(tl!("join-room-full"));
+                let state_guard = room.state.read().await;
+                if !matches!(*state_guard, InternalRoomState::SelectChart) {
+                    bail!(tl!("join-game-ongoing"));
+                }
+                if room.contains_user(user.id).await {
+                    bail!("already in room");
+                }
+                match room.add_user(Arc::downgrade(&user), monitor).await {
+                    AddUserResult::Added => {}
+                    AddUserResult::Full => bail!(tl!("join-room-full")),
+                    AddUserResult::Dropped => bail!("room not found"),
                 }
                 info!(
                     user = user.id,
@@ -737,16 +873,9 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 if monitor && !room.live.fetch_or(true, Ordering::SeqCst) {
                     info!(room = id.to_string(), "room goes live");
                 }
-                room.broadcast(ServerCommand::OnJoinRoom(user.to_info()))
-                    .await;
-                room.send(Message::JoinRoom {
-                    user: user.id,
-                    name: user.name.clone(),
-                })
-                .await;
                 *room_guard = Some(Arc::clone(&room));
-                Ok(JoinRoomResponse {
-                    state: room.client_room_state().await,
+                let join_resp = JoinRoomResponse {
+                    state: state_guard.to_client(room.chart.read().await.as_ref().map(|c| c.id)),
                     users: room
                         .users()
                         .await
@@ -755,25 +884,41 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                         .map(|it| it.to_info())
                         .collect(),
                     live: room.is_live(),
+                };
+                // Deliver JoinRoom(Ok) to the joiner before broadcasting OnJoinRoom/Message::JoinRoom
+                // so the client initializes `room` state prior to receiving room broadcasts.
+                user.try_send(ServerCommand::JoinRoom(Ok(join_resp))).await;
+                drop(state_guard);
+                drop(member_guard);
+                drop(room_guard);
+                room.broadcast(ServerCommand::OnJoinRoom(user.to_info()))
+                    .await;
+                room.send(Message::JoinRoom {
+                    user: user.id,
+                    name: user.name.clone(),
                 })
+                .await;
+                Ok(())
             }
             .await;
-            Some(ServerCommand::JoinRoom(err_to_str(res)))
+            match res {
+                Ok(()) => None,
+                Err(err) => Some(ServerCommand::JoinRoom(Err(err.to_string()))),
+            }
         }
         ClientCommand::LeaveRoom => {
             let res: Result<()> = async move {
                 get_room!(room);
-                // TODO is this necessary?
-                // if !matches!(*room.state.read().await, InternalRoomState::SelectChart) {
-                // bail!("game ongoing, can't leave");
-                // }
                 info!(
                     user = user.id,
                     room = room.id.to_string(),
                     "user leave room"
                 );
                 if room.on_user_leave(&user).await {
-                    user.server.rooms.write().await.remove(&room.id);
+                    let mut rooms = user.server.rooms.write().await;
+                    if rooms.get(&room.id).is_some_and(|r| Arc::ptr_eq(r, &room)) {
+                        rooms.remove(&room.id);
+                    }
                 }
                 Ok(())
             }
@@ -816,7 +961,13 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         }
         ClientCommand::SelectChart { id } => {
             let res: Result<()> = async move {
-                get_room!(room, InternalRoomState::SelectChart);
+                if !user.room_op_limit.lock().unwrap().take(15.0, 5.0) {
+                    bail!("rate limited");
+                }
+                get_room!(room);
+                if !matches!(*room.state.read().await, InternalRoomState::SelectChart) {
+                    bail!("invalid state");
+                }
                 room.check_host(&user).await?;
                 let span = debug_span!(
                     "select chart",
@@ -826,20 +977,38 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 );
                 async move {
                     trace!("fetch");
-                    let res: Chart = reqwest::get(format!("{HOST}/chart/{id}"))
+                    let res: Chart = user
+                        .server
+                        .http_client
+                        .get(format!("{HOST}/chart/{id}"))
+                        .send()
                         .await?
                         .error_for_status()?
                         .json()
                         .await?;
                     debug!("chart is {res:?}");
+                    let (chart_name, chart_id, room_state) = {
+                        let state_guard = room.state.write().await;
+                        if !matches!(*state_guard, InternalRoomState::SelectChart) {
+                            bail!("invalid state");
+                        }
+                        if !room.contains_user(user.id).await {
+                            bail!("no room");
+                        }
+                        room.check_host(&user).await?;
+                        let name = res.name.clone();
+                        let cid = res.id;
+                        *room.chart.write().await = Some(res);
+                        let room_state = state_guard.to_client(Some(cid));
+                        (name, cid, room_state)
+                    };
                     room.send(Message::SelectChart {
                         user: user.id,
-                        name: res.name.clone(),
-                        id: res.id,
+                        name: chart_name,
+                        id: chart_id,
                     })
                     .await;
-                    *room.chart.write().await = Some(res);
-                    room.on_state_change().await;
+                    room.broadcast(ServerCommand::ChangeState(room_state)).await;
                     Ok(())
                 }
                 .instrument(span)
@@ -851,18 +1020,30 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
 
         ClientCommand::RequestStart => {
             let res: Result<()> = async move {
-                get_room!(room, InternalRoomState::SelectChart);
-                room.check_host(&user).await?;
-                if room.chart.read().await.is_none() {
-                    bail!(tl!("start-no-chart-selected"));
-                }
-                debug!(room = room.id.to_string(), "room wait for ready");
+                get_room!(room);
+                let client_state = {
+                    let mut state_guard = room.state.write().await;
+                    if !matches!(*state_guard, InternalRoomState::SelectChart) {
+                        bail!("invalid state");
+                    }
+                    room.check_host(&user).await?;
+                    let chart_id = room
+                        .chart
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|c| c.id)
+                        .ok_or_else(|| anyhow!(tl!("start-no-chart-selected")))?;
+                    debug!(room = room.id.to_string(), "room wait for ready");
+                    *state_guard = InternalRoomState::WaitForReady {
+                        started: std::iter::once(user.id).collect::<HashSet<_>>(),
+                    };
+                    state_guard.to_client(Some(chart_id))
+                };
                 room.reset_game_time().await;
                 room.send(Message::GameStart { user: user.id }).await;
-                *room.state.write().await = InternalRoomState::WaitForReady {
-                    started: std::iter::once(user.id).collect::<HashSet<_>>(),
-                };
-                room.on_state_change().await;
+                room.broadcast(ServerCommand::ChangeState(client_state))
+                    .await;
                 room.check_all_ready().await;
                 Ok(())
             }
@@ -872,15 +1053,20 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         ClientCommand::Ready => {
             let res: Result<()> = async move {
                 get_room!(room);
-                let mut guard = room.state.write().await;
-                if let InternalRoomState::WaitForReady { started } = guard.deref_mut() {
+                {
+                    let mut guard = room.state.write().await;
+                    let InternalRoomState::WaitForReady { started } = guard.deref_mut() else {
+                        bail!("invalid state");
+                    };
+                    if !room.contains_user(user.id).await {
+                        bail!("no room");
+                    }
                     if !started.insert(user.id) {
                         bail!("already ready");
                     }
-                    room.send(Message::Ready { user: user.id }).await;
-                    drop(guard);
-                    room.check_all_ready().await;
                 }
+                room.send(Message::Ready { user: user.id }).await;
+                room.check_all_ready().await;
                 Ok(())
             }
             .await;
@@ -889,17 +1075,32 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         ClientCommand::CancelReady => {
             let res: Result<()> = async move {
                 get_room!(room);
-                let mut guard = room.state.write().await;
-                if let InternalRoomState::WaitForReady { started } = guard.deref_mut() {
-                    if !started.remove(&user.id) {
-                        bail!("not ready");
-                    }
+                enum CancelOutcome {
+                    CancelGame(phira_mp_common::RoomState),
+                    CancelReady,
+                }
+                let outcome = {
+                    let mut guard = room.state.write().await;
+                    let InternalRoomState::WaitForReady { started } = guard.deref_mut() else {
+                        bail!("invalid state");
+                    };
                     if room.check_host(&user).await.is_ok() {
-                        room.send(Message::CancelGame { user: user.id }).await;
                         *guard = InternalRoomState::SelectChart;
-                        drop(guard);
-                        room.on_state_change().await;
+                        let chart_id = room.chart.read().await.as_ref().map(|c| c.id);
+                        CancelOutcome::CancelGame(guard.to_client(chart_id))
                     } else {
+                        if !started.remove(&user.id) {
+                            bail!("not ready");
+                        }
+                        CancelOutcome::CancelReady
+                    }
+                };
+                match outcome {
+                    CancelOutcome::CancelGame(room_state) => {
+                        room.send(Message::CancelGame { user: user.id }).await;
+                        room.broadcast(ServerCommand::ChangeState(room_state)).await;
+                    }
+                    CancelOutcome::CancelReady => {
                         room.send(Message::CancelReady { user: user.id }).await;
                     }
                 }
@@ -910,38 +1111,38 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         }
         ClientCommand::Played { id } => {
             let res: Result<()> = async move {
+                if !user.room_op_limit.lock().unwrap().take(15.0, 5.0) {
+                    bail!("rate limited");
+                }
                 get_room!(room);
-                let res: Record = reqwest::get(format!("{HOST}/record/{id}"))
+                if user.monitor.load(Ordering::SeqCst) {
+                    bail!("invalid state");
+                }
+                {
+                    let guard = room.state.read().await;
+                    let InternalRoomState::Playing { results, aborted } = &*guard else {
+                        bail!("invalid state");
+                    };
+                    if aborted.contains(&user.id) {
+                        bail!("aborted");
+                    }
+                    if results.contains_key(&user.id) {
+                        bail!("already uploaded");
+                    }
+                }
+                let res: Record = user
+                    .server
+                    .http_client
+                    .get(format!("{HOST}/record/{id}"))
+                    .send()
                     .await?
                     .error_for_status()?
                     .json()
                     .await?;
-                if res.player != user.id {
+                if res.id != id {
                     bail!("invalid record");
                 }
-                debug!(
-                    room = room.id.to_string(),
-                    user = user.id,
-                    "user played: {res:?}"
-                );
-                room.send(Message::Played {
-                    user: user.id,
-                    score: res.score,
-                    accuracy: res.accuracy,
-                    full_combo: res.full_combo,
-                })
-                .await;
-                let mut guard = room.state.write().await;
-                if let InternalRoomState::Playing { results, aborted } = guard.deref_mut() {
-                    if aborted.contains(&user.id) {
-                        bail!("aborted");
-                    }
-                    if results.insert(user.id, res).is_some() {
-                        bail!("already uploaded");
-                    }
-                    drop(guard);
-                    room.check_all_ready().await;
-                }
+                apply_played_record(&user, &room, res).await?;
                 Ok(())
             }
             .await;
@@ -950,18 +1151,23 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         ClientCommand::Abort => {
             let res: Result<()> = async move {
                 get_room!(room);
-                let mut guard = room.state.write().await;
-                if let InternalRoomState::Playing { results, aborted } = guard.deref_mut() {
+                if user.monitor.load(Ordering::SeqCst) {
+                    bail!("invalid state");
+                }
+                {
+                    let mut guard = room.state.write().await;
+                    let InternalRoomState::Playing { results, aborted } = guard.deref_mut() else {
+                        bail!("invalid state");
+                    };
                     if results.contains_key(&user.id) {
                         bail!("already uploaded");
                     }
                     if !aborted.insert(user.id) {
                         bail!("aborted");
                     }
-                    drop(guard);
-                    room.send(Message::Abort { user: user.id }).await;
-                    room.check_all_ready().await;
                 }
+                room.send(Message::Abort { user: user.id }).await;
+                room.check_all_ready().await;
                 Ok(())
             }
             .await;
@@ -1367,5 +1573,372 @@ mod tests {
         })
         .await
         .expect("timed out waiting for burst disconnects to clean up");
+    }
+
+    async fn connect_client_pair(
+        state: &Arc<ServerState>,
+        user_id: i32,
+        name: &str,
+    ) -> (
+        Arc<User>,
+        Stream<ClientCommand, ServerCommand>,
+        mpsc::UnboundedReceiver<ServerCommand>,
+    ) {
+        let user = Arc::new(User::new(
+            user_id,
+            name.to_owned(),
+            Language::default(),
+            Arc::clone(state),
+        ));
+        state.users.write().await.insert(user_id, Arc::clone(&user));
+        let (srv_sock, cli_sock) = loopback_pair().await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client_fut = Stream::<ClientCommand, ServerCommand>::new(
+            Some(1),
+            cli_sock,
+            Box::new(move |_, cmd| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(cmd);
+                }
+            }),
+        );
+        let server_fut = Session::connect_test_user(
+            Uuid::new_v4(),
+            srv_sock,
+            Arc::clone(&user),
+            Duration::from_secs(60),
+        );
+        let (client_res, _session) = tokio::join!(client_fut, server_fut);
+        (user, client_res.unwrap(), rx)
+    }
+
+    async fn recv_cmd(rx: &mut mpsc::UnboundedReceiver<ServerCommand>) -> ServerCommand {
+        time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for ServerCommand")
+            .expect("ServerCommand stream closed")
+    }
+
+    #[tokio::test]
+    async fn join_room_delivers_ok_before_broadcast_and_uses_ptr_eq_on_leave() {
+        let (state, _lost_rx) = dummy_state();
+        let (host, host_cli, mut host_rx) = connect_client_pair(&state, 1, "host").await;
+        let (joiner, joiner_cli, mut joiner_rx) = connect_client_pair(&state, 2, "joiner").await;
+
+        let rid: phira_mp_common::RoomId = "order-room".to_owned().try_into().unwrap();
+        host_cli
+            .send(ClientCommand::CreateRoom { id: rid.clone() })
+            .await
+            .unwrap();
+        // Wait until CreateRoom settles cleanly.
+        let _ = recv_cmd(&mut host_rx).await;
+        let _ = recv_cmd(&mut host_rx).await;
+
+        joiner_cli
+            .send(ClientCommand::JoinRoom {
+                id: rid.clone(),
+                monitor: false,
+            })
+            .await
+            .unwrap();
+
+        // Joiner MUST receive ServerCommand::JoinRoom(Ok(...)) strictly BEFORE OnJoinRoom / Message::JoinRoom.
+        let first = recv_cmd(&mut joiner_rx).await;
+        assert!(
+            matches!(first, ServerCommand::JoinRoom(Ok(_))),
+            "expected JoinRoom(Ok) first, got {first:?}"
+        );
+        let second = recv_cmd(&mut joiner_rx).await;
+        assert!(matches!(second, ServerCommand::OnJoinRoom(_)));
+        let third = recv_cmd(&mut joiner_rx).await;
+        assert!(matches!(
+            third,
+            ServerCommand::Message(Message::JoinRoom { user: 2, .. })
+        ));
+
+        // Also test that LeaveRoom checks Arc::ptr_eq before deleting a recreated room.
+        let old_room = Arc::clone(host.room.read().await.as_ref().unwrap());
+        let new_room = Arc::new(Room::new(rid.clone(), Arc::downgrade(&joiner)));
+        state
+            .rooms
+            .write()
+            .await
+            .insert(rid.clone(), Arc::clone(&new_room));
+        assert!(!old_room.on_user_leave(&joiner).await);
+        assert!(matches!(
+            process(Arc::clone(&host), ClientCommand::LeaveRoom).await,
+            Some(ServerCommand::LeaveRoom(Ok(())))
+        ));
+        assert!(
+            Arc::ptr_eq(state.rooms.read().await.get(&rid).unwrap(), &new_room),
+            "leaving old room must not delete newly recreated room with the same ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_ready_allows_new_host_not_in_started_and_rejects_wrong_state() {
+        let (state, _lost_rx) = dummy_state();
+        let host = Arc::new(User::new(
+            1,
+            "host".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        let p2 = Arc::new(User::new(
+            2,
+            "p2".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        let rid: phira_mp_common::RoomId = "cancel-room".to_owned().try_into().unwrap();
+        let room = Arc::new(Room::new(rid.clone(), Arc::downgrade(&host)));
+        assert_eq!(
+            room.add_user(Arc::downgrade(&p2), false).await,
+            AddUserResult::Added
+        );
+        *host.room.write().await = Some(Arc::clone(&room));
+        *p2.room.write().await = Some(Arc::clone(&room));
+        *room.chart.write().await = Some(Chart {
+            id: 10,
+            name: "test".to_owned(),
+        });
+        state.rooms.write().await.insert(rid, Arc::clone(&room));
+
+        // Ready / CancelReady / Abort in SelectChart must all return Err (not silent Ok).
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::Ready).await,
+            Some(ServerCommand::Ready(Err(_)))
+        ));
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::CancelReady).await,
+            Some(ServerCommand::CancelReady(Err(_)))
+        ));
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::Abort).await,
+            Some(ServerCommand::Abort(Err(_)))
+        ));
+
+        // Host requests start -> WaitForReady { started: {1} }.
+        assert!(matches!(
+            process(Arc::clone(&host), ClientCommand::RequestStart).await,
+            Some(ServerCommand::RequestStart(Ok(())))
+        ));
+
+        // Original host leaves; p2 becomes new host even though p2 is NOT in `started`.
+        assert!(!room.on_user_leave(&host).await);
+        assert_eq!(room.host.read().await.upgrade().unwrap().id, 2);
+
+        // New host p2 must be able to cancel the game back to SelectChart.
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::CancelReady).await,
+            Some(ServerCommand::CancelReady(Ok(())))
+        ));
+        assert!(matches!(
+            *room.state.read().await,
+            InternalRoomState::SelectChart
+        ));
+    }
+
+    #[tokio::test]
+    async fn played_validation_rejects_monitor_wrong_state_aborted_and_duplicate_record() {
+        let (state, _lost_rx) = dummy_state();
+        let p1 = Arc::new(User::new(
+            1,
+            "p1".into(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        let p2 = Arc::new(User::new(
+            2,
+            "p2".into(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        let mon = Arc::new(User::new(
+            3,
+            "mon".into(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        mon.monitor.store(true, Ordering::SeqCst);
+
+        let room = Arc::new(Room::new(
+            "play-room".to_owned().try_into().unwrap(),
+            Arc::downgrade(&p1),
+        ));
+        assert_eq!(
+            room.add_user(Arc::downgrade(&p2), false).await,
+            AddUserResult::Added
+        );
+        assert_eq!(
+            room.add_user(Arc::downgrade(&mon), true).await,
+            AddUserResult::Added
+        );
+        *p1.room.write().await = Some(Arc::clone(&room));
+        *p2.room.write().await = Some(Arc::clone(&room));
+        *mon.room.write().await = Some(Arc::clone(&room));
+
+        let make_rec = |rec_id, player| Record {
+            id: rec_id,
+            player,
+            score: 900_000,
+            perfect: 100,
+            good: 0,
+            bad: 0,
+            miss: 0,
+            max_combo: 100,
+            accuracy: 1.0,
+            full_combo: true,
+            std: 0.0,
+            std_score: 0.0,
+        };
+
+        // Wrong state (SelectChart) rejected.
+        assert!(
+            apply_played_record(&p1, &room, make_rec(501, 1))
+                .await
+                .is_err()
+        );
+
+        // Enter Playing.
+        *room.state.write().await = InternalRoomState::Playing {
+            results: std::collections::HashMap::new(),
+            aborted: HashSet::new(),
+        };
+        // Monitor cannot submit Played or Abort.
+        assert!(
+            apply_played_record(&mon, &room, make_rec(502, 3))
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            process(Arc::clone(&mon), ClientCommand::Abort).await,
+            Some(ServerCommand::Abort(Err(_)))
+        ));
+        // Wrong player record rejected.
+        assert!(
+            apply_played_record(&p1, &room, make_rec(503, 2))
+                .await
+                .is_err()
+        );
+        // Aborted player cannot submit Played.
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::Abort).await,
+            Some(ServerCommand::Abort(Ok(())))
+        ));
+        assert!(
+            apply_played_record(&p2, &room, make_rec(504, 2))
+                .await
+                .is_err()
+        );
+
+        // Valid upload finishes round 1 -> transitions to SelectChart.
+        assert!(
+            apply_played_record(&p1, &room, make_rec(505, 1))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            *room.state.read().await,
+            InternalRoomState::SelectChart
+        ));
+
+        // Re-using the exact same record ID 505 in round 2 must be rejected.
+        *room.state.write().await = InternalRoomState::Playing {
+            results: std::collections::HashMap::new(),
+            aborted: HashSet::new(),
+        };
+        assert!(
+            apply_played_record(&p1, &room, make_rec(505, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn touches_enforces_playing_non_monitor_and_preserves_fifo_order() {
+        let (mut state, _lost_rx) = dummy_state();
+        Arc::get_mut(&mut state).unwrap().config.monitors = vec![2];
+        let (p1, p1_cli, _p1_rx) = connect_client_pair(&state, 1, "p1").await;
+        let (_mon, mon_cli, mut mon_rx) = connect_client_pair(&state, 2, "mon").await;
+
+        let rid: phira_mp_common::RoomId = "live-room".to_owned().try_into().unwrap();
+        let room = Arc::new(Room::new(rid.clone(), Arc::downgrade(&p1)));
+        *p1.room.write().await = Some(Arc::clone(&room));
+        state
+            .rooms
+            .write()
+            .await
+            .insert(rid.clone(), Arc::clone(&room));
+
+        mon_cli
+            .send(ClientCommand::JoinRoom {
+                id: rid,
+                monitor: true,
+            })
+            .await
+            .unwrap();
+        // Wait for JoinRoom(Ok) + OnJoinRoom + JoinRoom message on monitor.
+        let _ = recv_cmd(&mut mon_rx).await;
+        let _ = recv_cmd(&mut mon_rx).await;
+        let _ = recv_cmd(&mut mon_rx).await;
+        assert!(room.is_live());
+
+        // Touches during SelectChart must be ignored (monitor receives nothing).
+        p1_cli
+            .send(ClientCommand::Touches {
+                frames: Arc::new(vec![TouchFrame {
+                    time: 999.0,
+                    points: vec![],
+                }]),
+            })
+            .await
+            .unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(80), mon_rx.recv())
+                .await
+                .is_err()
+        );
+
+        // Enter Playing.
+        *room.state.write().await = InternalRoomState::Playing {
+            results: std::collections::HashMap::new(),
+            aborted: HashSet::new(),
+        };
+
+        // Touches sent by monitor must be ignored.
+        mon_cli
+            .send(ClientCommand::Touches {
+                frames: Arc::new(vec![TouchFrame {
+                    time: 888.0,
+                    points: vec![],
+                }]),
+            })
+            .await
+            .unwrap();
+
+        // Send 20 touch packets sequentially from p1; monitor must receive all 20 in exact order.
+        for i in 0..20u32 {
+            p1_cli
+                .send(ClientCommand::Touches {
+                    frames: Arc::new(vec![TouchFrame {
+                        time: i as f32,
+                        points: vec![],
+                    }]),
+                })
+                .await
+                .unwrap();
+        }
+        for i in 0..20u32 {
+            match recv_cmd(&mut mon_rx).await {
+                ServerCommand::Touches { player, frames } => {
+                    assert_eq!(player, 1);
+                    assert_eq!(frames.len(), 1);
+                    assert_eq!(frames[0].time, i as f32);
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
     }
 }

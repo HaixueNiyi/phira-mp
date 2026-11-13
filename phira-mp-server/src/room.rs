@@ -10,8 +10,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tokio::{
+    sync::{Mutex, RwLock, mpsc},
+    task::JoinHandle,
+};
+use tracing::{debug, info, warn};
 
 const ROOM_MAX_USERS: usize = 8;
 
@@ -38,6 +41,13 @@ impl InternalRoomState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddUserResult {
+    Added,
+    Full,
+    Dropped,
+}
+
 pub struct Room {
     pub id: RoomId,
     pub host: RwLock<Weak<User>>,
@@ -48,9 +58,12 @@ pub struct Room {
     pub live: AtomicBool,
     pub locked: AtomicBool,
     pub cycle: AtomicBool,
+    pub dropped: AtomicBool,
 
     users: RwLock<Vec<Weak<User>>>,
-    monitors: RwLock<Vec<Weak<User>>>,
+    monitors: Arc<RwLock<Vec<Weak<User>>>>,
+    monitor_tx: mpsc::Sender<ServerCommand>,
+    monitor_task_handle: JoinHandle<()>,
     pub chart: RwLock<Option<Chart>>,
 }
 
@@ -59,6 +72,24 @@ impl Room {
         if let Some(user) = host.upgrade() {
             user.monitor.store(false, Ordering::SeqCst);
         }
+        let monitors = Arc::new(RwLock::new(Vec::<Weak<User>>::new()));
+        let (monitor_tx, mut monitor_rx) = mpsc::channel::<ServerCommand>(512);
+        let monitor_task_handle = tokio::spawn({
+            let monitors = Arc::clone(&monitors);
+            async move {
+                while let Some(cmd) = monitor_rx.recv().await {
+                    let targets: Vec<Arc<User>> = monitors
+                        .read()
+                        .await
+                        .iter()
+                        .filter_map(|it| it.upgrade())
+                        .collect();
+                    for user in targets {
+                        user.try_send(cmd.clone()).await;
+                    }
+                }
+            }
+        });
         Self {
             id,
             host: host.clone().into(),
@@ -69,11 +100,18 @@ impl Room {
             live: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             cycle: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
 
             users: vec![host].into(),
-            monitors: Vec::new().into(),
+            monitors,
+            monitor_tx,
+            monitor_task_handle,
             chart: RwLock::default(),
         }
+    }
+
+    pub fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::SeqCst)
     }
 
     pub fn is_live(&self) -> bool {
@@ -120,20 +158,29 @@ impl Room {
             .await;
     }
 
-    pub async fn add_user(&self, user: Weak<User>, monitor: bool) -> bool {
+    pub async fn add_user(&self, user: Weak<User>, monitor: bool) -> AddUserResult {
+        if self.is_dropped() {
+            return AddUserResult::Dropped;
+        }
         if monitor {
             let mut guard = self.monitors.write().await;
+            if self.is_dropped() {
+                return AddUserResult::Dropped;
+            }
             guard.retain(|it| it.strong_count() > 0);
             guard.push(user);
-            true
+            AddUserResult::Added
         } else {
             let mut guard = self.users.write().await;
+            if self.is_dropped() {
+                return AddUserResult::Dropped;
+            }
             guard.retain(|it| it.strong_count() > 0);
             if guard.len() >= ROOM_MAX_USERS {
-                false
+                AddUserResult::Full
             } else {
                 guard.push(user);
-                true
+                AddUserResult::Added
             }
         }
     }
@@ -183,9 +230,12 @@ impl Room {
         }
     }
 
-    pub async fn broadcast_monitors(&self, cmd: ServerCommand) {
-        for session in self.monitors().await {
-            session.try_send(cmd.clone()).await;
+    pub fn queue_monitor(&self, cmd: ServerCommand) {
+        if let Err(err) = self.monitor_tx.try_send(cmd) {
+            warn!(
+                room = self.id.to_string(),
+                "dropping live monitor packet: {err:?}"
+            );
         }
     }
 
@@ -221,7 +271,15 @@ impl Room {
         }
 
         let is_host = self.check_host(user).await.is_ok();
-        let users = self.users().await;
+        let users = {
+            let mut guard = self.users.write().await;
+            guard.retain(|it| it.strong_count() > 0);
+            let users: Vec<Arc<User>> = guard.iter().filter_map(Weak::upgrade).collect();
+            if users.is_empty() {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+            users
+        };
         if users.is_empty() {
             if is_host {
                 info!("host disconnected!");
@@ -333,6 +391,12 @@ impl Room {
     }
 }
 
+impl Drop for Room {
+    fn drop(&mut self) {
+        self.monitor_task_handle.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,8 +460,14 @@ mod tests {
                 test_user(&state, 3),
             );
             let room = Arc::new(Room::new(room_id(&format!("r{i}")), Arc::downgrade(&a)));
-            assert!(room.add_user(Arc::downgrade(&b), false).await);
-            assert!(room.add_user(Arc::downgrade(&c), false).await);
+            assert_eq!(
+                room.add_user(Arc::downgrade(&b), false).await,
+                AddUserResult::Added
+            );
+            assert_eq!(
+                room.add_user(Arc::downgrade(&c), false).await,
+                AddUserResult::Added
+            );
             room.cycle.store(true, Ordering::SeqCst);
             *room.state.write().await = InternalRoomState::Playing {
                 results: [1, 2, 3]
@@ -455,7 +525,10 @@ mod tests {
         let room = Arc::new(Room::new(room_id("m2"), Arc::downgrade(&host)));
         *host.room.write().await = Some(Arc::clone(&room));
 
-        assert!(room.add_user(Arc::downgrade(&mon), true).await);
+        assert_eq!(
+            room.add_user(Arc::downgrade(&mon), true).await,
+            AddUserResult::Added
+        );
         mon.monitor.store(true, Ordering::SeqCst);
         room.live.store(true, Ordering::SeqCst);
         *mon.room.write().await = Some(Arc::clone(&room));
@@ -484,10 +557,16 @@ mod tests {
         *host.room.write().await = Some(Arc::clone(&room));
         room.cycle.store(true, Ordering::SeqCst);
 
-        assert!(room.add_user(Arc::downgrade(&mon1), true).await);
+        assert_eq!(
+            room.add_user(Arc::downgrade(&mon1), true).await,
+            AddUserResult::Added
+        );
         mon1.monitor.store(true, Ordering::SeqCst);
         *mon1.room.write().await = Some(Arc::clone(&room));
-        assert!(room.add_user(Arc::downgrade(&mon2), true).await);
+        assert_eq!(
+            room.add_user(Arc::downgrade(&mon2), true).await,
+            AddUserResult::Added
+        );
         mon2.monitor.store(true, Ordering::SeqCst);
         *mon2.room.write().await = Some(Arc::clone(&room));
         room.live.store(true, Ordering::SeqCst);
