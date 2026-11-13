@@ -1,4 +1,4 @@
-use crate::{IdMap, Room, SafeMap, Session, User, vacant_entry};
+use crate::{IdMap, Room, SafeMap, Session, User, vacant_id};
 use anyhow::{Context, Result};
 use phira_mp_common::RoomId;
 use serde::Deserialize;
@@ -153,8 +153,8 @@ impl Server {
         tokio::spawn(async move {
             let _permit = permit;
             let id = {
-                let mut guard = state.sessions.write().await;
-                *vacant_entry(&mut guard).key()
+                let guard = state.sessions.read().await;
+                vacant_id(&guard)
             };
             match Session::new(id, stream, Arc::clone(&state)).await {
                 Ok(session) => {

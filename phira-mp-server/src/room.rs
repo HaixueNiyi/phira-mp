@@ -67,6 +67,23 @@ pub struct Room {
     pub chart: RwLock<Option<Chart>>,
 }
 
+fn remove_user_ptr(list: &mut Vec<Weak<User>>, user: &User) -> bool {
+    let mut found = false;
+    list.retain(|it| {
+        if let Some(u) = it.upgrade() {
+            if std::ptr::eq(Arc::as_ptr(&u), user) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    });
+    found
+}
+
 impl Room {
     pub fn new(id: RoomId, host: Weak<User>) -> Self {
         if let Some(user) = host.upgrade() {
@@ -251,26 +268,43 @@ impl Room {
     /// Return: should the room be dropped
     #[must_use]
     pub async fn on_user_leave(&self, user: &User) -> bool {
+        let removed_monitor = {
+            let mut monitors = self.monitors.write().await;
+            let found = remove_user_ptr(&mut monitors, user);
+            if found && !monitors.iter().any(|it| it.strong_count() > 0) {
+                self.live.store(false, Ordering::SeqCst);
+            }
+            found
+        };
+        let removed_user = if removed_monitor {
+            false
+        } else {
+            let mut users = self.users.write().await;
+            remove_user_ptr(&mut users, user)
+        };
+        if !removed_monitor && !removed_user {
+            return false;
+        }
+
+        if removed_monitor {
+            user.monitor.store(false, Ordering::SeqCst);
+        }
+        {
+            let mut room_guard = user.room.write().await;
+            if room_guard
+                .as_ref()
+                .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), self))
+            {
+                *room_guard = None;
+            }
+        }
         self.send(Message::LeaveRoom {
             user: user.id,
             name: user.name.clone(),
         })
         .await;
-        *user.room.write().await = None;
-        if user.monitor.swap(false, Ordering::SeqCst) {
-            let mut monitors = self.monitors.write().await;
-            monitors.retain(|it| it.upgrade().is_some_and(|it| it.id != user.id));
-            if !monitors.iter().any(|it| it.strong_count() > 0) {
-                self.live.store(false, Ordering::SeqCst);
-            }
-        } else {
-            self.users
-                .write()
-                .await
-                .retain(|it| it.upgrade().is_some_and(|it| it.id != user.id));
-        }
 
-        let is_host = self.check_host(user).await.is_ok();
+        let is_host = std::ptr::eq(self.host.read().await.as_ptr(), user);
         let users = {
             let mut guard = self.users.write().await;
             guard.retain(|it| it.strong_count() > 0);
@@ -293,21 +327,23 @@ impl Room {
                 .filter_map(|it| it.upgrade())
                 .collect();
             for monitor in monitors {
-                monitor.monitor.store(false, Ordering::SeqCst);
                 let mut room_guard = monitor.room.write().await;
-                if room_guard
+                let was_in_this_room = room_guard
                     .as_ref()
-                    .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), self))
-                {
+                    .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), self));
+                if was_in_this_room {
                     *room_guard = None;
                 }
                 drop(room_guard);
-                monitor
-                    .try_send(ServerCommand::Message(Message::LeaveRoom {
-                        user: monitor.id,
-                        name: monitor.name.clone(),
-                    }))
-                    .await;
+                if was_in_this_room {
+                    monitor.monitor.store(false, Ordering::SeqCst);
+                    monitor
+                        .try_send(ServerCommand::Message(Message::LeaveRoom {
+                            user: monitor.id,
+                            name: monitor.name.clone(),
+                        }))
+                        .await;
+                }
             }
             self.live.store(false, Ordering::SeqCst);
             return true;
@@ -588,5 +624,35 @@ mod tests {
             *room.state.read().await,
             InternalRoomState::SelectChart
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_user_arc_on_leave_does_not_evict_reconnected_user() {
+        let state = test_server_state();
+        let host = test_user(&state, 1);
+        let u1_old = test_user(&state, 2);
+        let u2_new = test_user(&state, 2);
+        let room = Arc::new(Room::new(room_id("ptr-leave"), Arc::downgrade(&host)));
+        *host.room.write().await = Some(Arc::clone(&room));
+
+        // Simulate u1_old having already been dropped/removed from room.users and replaced by
+        // a newly authenticated u2_new sharing the same user.id.
+        assert_eq!(
+            room.add_user(Arc::downgrade(&u2_new), false).await,
+            AddUserResult::Added
+        );
+        *u2_new.room.write().await = Some(Arc::clone(&room));
+
+        assert!(!room.on_user_leave(&u1_old).await);
+        assert!(
+            room.users().await.iter().any(|u| Arc::ptr_eq(u, &u2_new)),
+            "stale Arc<User> must not evict newly reconnected Arc<User> with same ID"
+        );
+        assert!(u2_new.room.read().await.is_some());
+
+        // Normal leave on u2_new succeeds once and is idempotent on repeat calls.
+        assert!(!room.on_user_leave(&u2_new).await);
+        assert!(!room.on_user_leave(&u2_new).await);
+        assert!(u2_new.room.read().await.is_none());
     }
 }

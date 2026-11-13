@@ -12,10 +12,7 @@ pub use session::*;
 use anyhow::Result;
 use clap::Parser;
 use std::{
-    collections::{
-        HashMap,
-        hash_map::{Entry, VacantEntry},
-    },
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     time::Duration,
@@ -28,15 +25,12 @@ use uuid::Uuid;
 pub type SafeMap<K, V> = RwLock<HashMap<K, V>>;
 pub type IdMap<V> = SafeMap<Uuid, V>;
 
-fn vacant_entry<V>(map: &mut HashMap<Uuid, V>) -> VacantEntry<'_, Uuid, V> {
+fn vacant_id<V>(map: &HashMap<Uuid, V>) -> Uuid {
     let mut id = Uuid::new_v4();
     while map.contains_key(&id) {
         id = Uuid::new_v4();
     }
-    match map.entry(id) {
-        Entry::Vacant(entry) => entry,
-        _ => unreachable!(),
-    }
+    id
 }
 
 /// `max_files == 0` keeps every rotated log file.
