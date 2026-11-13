@@ -670,3 +670,110 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phira_mp_common::CompactPos;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn client_applies_room_updates_in_tcp_order_and_clears_state_on_leave() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _srv_stream = Stream::<ServerCommand, ClientCommand>::new(
+                None,
+                sock,
+                Box::new(|send_tx, cmd| async move {
+                    match cmd {
+                        ClientCommand::Ping => {
+                            let _ = send_tx.send(ServerCommand::Pong).await;
+                        }
+                        ClientCommand::Authenticate { .. } => {
+                            let me = UserInfo {
+                                id: 1,
+                                name: "alice".to_owned(),
+                                monitor: false,
+                            };
+                            let _ = send_tx
+                                .send(ServerCommand::Authenticate(Ok((me, None))))
+                                .await;
+                        }
+                        ClientCommand::JoinRoom { .. } => {
+                            let me = UserInfo {
+                                id: 1,
+                                name: "alice".to_owned(),
+                                monitor: false,
+                            };
+                            let other = UserInfo {
+                                id: 2,
+                                name: "bob".to_owned(),
+                                monitor: false,
+                            };
+                            let resp = JoinRoomResponse {
+                                state: RoomState::default(),
+                                users: vec![me],
+                                live: false,
+                            };
+                            let _ = send_tx.send(ServerCommand::JoinRoom(Ok(resp))).await;
+                            let _ = send_tx.send(ServerCommand::OnJoinRoom(other)).await;
+                            let _ = send_tx
+                                .send(ServerCommand::Message(Message::LockRoom { lock: true }))
+                                .await;
+                            let _ = send_tx
+                                .send(ServerCommand::Touches {
+                                    player: 2,
+                                    frames: Arc::new(vec![TouchFrame {
+                                        time: 1.0,
+                                        points: vec![(0, CompactPos::new(0.5, 0.5))],
+                                    }]),
+                                })
+                                .await;
+                        }
+                        ClientCommand::LeaveRoom => {
+                            let _ = send_tx.send(ServerCommand::LeaveRoom(Ok(()))).await;
+                        }
+                        _ => {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let client = Client::from_address(&addr.to_string()).await.unwrap();
+        assert!(client.ping().await.is_ok());
+        client.authenticate("test-token").await.unwrap();
+        assert_eq!(client.state.me.read().await.as_ref().unwrap().id, 1);
+
+        let rid: RoomId = "sync-room".to_owned().try_into().unwrap();
+        client.join_room(rid.clone(), false).await.unwrap();
+
+        // Give the burst follow-up packets a moment to process in recv_task_handle.
+        time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Some(room) = client.state.room.read().await.as_ref()
+                    && room.users.contains_key(&2)
+                    && room.locked
+                    && client.state.live_players.contains_key(&2)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("subsequent push commands were dropped before client room initialization");
+
+        client.leave_room().await.unwrap();
+        assert!(client.state.room.read().await.is_none());
+        assert!(client.state.live_players.is_empty());
+
+        drop(client);
+        server_task.abort();
+    }
+}
