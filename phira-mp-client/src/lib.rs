@@ -15,14 +15,29 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, Notify, RwLock, oneshot},
+    sync::{Mutex, RwLock, oneshot, watch},
     task::JoinHandle,
     time,
 };
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
-type Callback<T> = Mutex<Option<oneshot::Sender<T>>>;
-type RCallback<T, E = String> = Mutex<Option<oneshot::Sender<Result<T, E>>>>;
+const MAX_QUEUED_MESSAGES: usize = 1024;
+
+struct CallbackSlot<T> {
+    call_lock: Mutex<()>,
+    tx: Mutex<Option<oneshot::Sender<T>>>,
+}
+
+impl<T> Default for CallbackSlot<T> {
+    fn default() -> Self {
+        Self {
+            call_lock: Mutex::default(),
+            tx: Mutex::default(),
+        }
+    }
+}
+
+type RCallback<T, E = String> = CallbackSlot<Result<T, E>>;
 
 pub const TIMEOUT: Duration = Duration::from_secs(7);
 
@@ -48,7 +63,8 @@ impl LivePlayer {
 
 struct State {
     delay: Mutex<Option<Duration>>,
-    ping_notify: Notify,
+    ping_lock: Mutex<()>,
+    pong_tx: Mutex<Option<oneshot::Sender<()>>>,
 
     me: RwLock<Option<UserInfo>>,
     room: RwLock<Option<ClientRoomState>>,
@@ -97,24 +113,25 @@ impl Client {
 
         let state = Arc::new(State {
             delay: Mutex::default(),
-            ping_notify: Notify::new(),
+            ping_lock: Mutex::default(),
+            pong_tx: Mutex::default(),
 
             me: RwLock::default(),
             room: RwLock::default(),
 
-            cb_authenticate: Callback::default(),
-            cb_chat: Callback::default(),
-            cb_create_room: Callback::default(),
-            cb_join_room: Callback::default(),
-            cb_leave_room: Callback::default(),
-            cb_lock_room: Callback::default(),
-            cb_cycle_room: Callback::default(),
-            cb_select_chart: Callback::default(),
-            cb_request_start: Callback::default(),
-            cb_ready: Callback::default(),
-            cb_cancel_ready: Callback::default(),
-            cb_played: Callback::default(),
-            cb_abort: Callback::default(),
+            cb_authenticate: CallbackSlot::default(),
+            cb_chat: CallbackSlot::default(),
+            cb_create_room: CallbackSlot::default(),
+            cb_join_room: CallbackSlot::default(),
+            cb_leave_room: CallbackSlot::default(),
+            cb_lock_room: CallbackSlot::default(),
+            cb_cycle_room: CallbackSlot::default(),
+            cb_select_chart: CallbackSlot::default(),
+            cb_request_start: CallbackSlot::default(),
+            cb_ready: CallbackSlot::default(),
+            cb_cancel_ready: CallbackSlot::default(),
+            cb_played: CallbackSlot::default(),
+            cb_abort: CallbackSlot::default(),
 
             live_players: DashMap::new(),
             messages: Mutex::default(),
@@ -136,25 +153,33 @@ impl Client {
             let ping_fail_count = Arc::clone(&ping_fail_count);
             let state = Arc::clone(&state);
             let stream = Arc::clone(&stream);
+            let mut closed_rx = stream.closed();
             async move {
                 loop {
-                    time::sleep(HEARTBEAT_INTERVAL).await;
-
-                    let start = Instant::now();
-                    if let Err(err) = stream.send(ClientCommand::Ping).await {
-                        error!("failed to send heartbeat: {err:?}");
-                    } else if time::timeout(HEARTBEAT_TIMEOUT, state.ping_notify.notified())
-                        .await
-                        .is_err()
-                    {
-                        warn!("heartbeat timeout");
-                        ping_fail_count.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        ping_fail_count.store(0, Ordering::SeqCst);
+                    tokio::select! {
+                        _ = time::sleep(HEARTBEAT_INTERVAL) => {}
+                        _ = wait_until_closed(&mut closed_rx) => break,
                     }
-                    let delay = start.elapsed();
-                    *state.delay.lock().await = Some(delay);
-                    trace!("sent heartbeat, delay: {delay:?}");
+                    if stream.is_closed() {
+                        break;
+                    }
+                    match send_ping(&state, &stream).await {
+                        Ok(delay) => {
+                            ping_fail_count.store(0, Ordering::SeqCst);
+                            trace!("sent heartbeat, delay: {delay:?}");
+                        }
+                        Err(err) => {
+                            if stream.is_closed() {
+                                break;
+                            }
+                            warn!("heartbeat timeout or error: {err:?}");
+                            let _ = ping_fail_count.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |cur| Some(cur.saturating_add(1)),
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -176,14 +201,17 @@ impl Client {
         Self::new(stream).await
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn me(&self) -> Option<UserInfo> {
         self.state.me.blocking_read().clone()
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn user_name(&self, id: i32) -> String {
         self.user_name_opt(id).unwrap_or_else(|| "?".to_owned())
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn user_name_opt(&self, id: i32) -> Option<String> {
         self.state
             .room
@@ -192,14 +220,17 @@ impl Client {
             .and_then(|it| it.users.get(&id).map(|it| it.name.clone()))
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_take_messages(&self) -> Vec<Message> {
         self.state.messages.blocking_lock().drain(..).collect()
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_state(&self) -> Option<ClientRoomState> {
         self.state.room.blocking_read().clone()
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_room_id(&self) -> Option<RoomId> {
         self.state
             .room
@@ -208,6 +239,7 @@ impl Client {
             .map(|it| it.id.clone())
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_room_state(&self) -> Option<RoomState> {
         self.state.room.blocking_read().as_ref().map(|it| it.state)
     }
@@ -216,6 +248,7 @@ impl Client {
         self.state.room.read().await.as_ref().map(|it| it.state)
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_is_host(&self) -> Option<bool> {
         self.state
             .room
@@ -224,6 +257,7 @@ impl Client {
             .map(|it| it.is_host)
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn blocking_is_ready(&self) -> Option<bool> {
         self.state
             .room
@@ -233,28 +267,30 @@ impl Client {
     }
 
     pub async fn ping(&self) -> Result<Duration> {
-        let start = Instant::now();
-        self.stream.send(ClientCommand::Ping).await?;
-        time::timeout(HEARTBEAT_TIMEOUT, self.state.ping_notify.notified())
-            .await
-            .context("heartbeat timeout")?;
-        let delay = start.elapsed();
-        *self.state.delay.lock().await = Some(delay);
-        Ok(delay)
+        send_ping(&self.state, &self.stream).await
     }
 
+    /// Must not be called from within a Tokio runtime worker thread.
     pub fn delay(&self) -> Option<Duration> {
         *self.state.delay.blocking_lock()
     }
 
     async fn rcall<R>(&self, payload: ClientCommand, cb: &RCallback<R>) -> Result<R> {
-        self.stream.send(payload).await?;
+        let _call_guard = cb.call_lock.lock().await;
         let (tx, rx) = oneshot::channel();
-        *cb.lock().await = Some(tx);
-        time::timeout(TIMEOUT, rx)
-            .await
-            .context("timeout")??
-            .map_err(Error::msg)
+        *cb.tx.lock().await = Some(tx);
+        if let Err(err) = self.stream.send(payload).await {
+            *cb.tx.lock().await = None;
+            return Err(err);
+        }
+        match time::timeout(TIMEOUT, rx).await {
+            Ok(Ok(res)) => res.map_err(Error::msg),
+            Ok(Err(_)) => Err(Error::msg("response channel closed")),
+            Err(_) => {
+                *cb.tx.lock().await = None;
+                anyhow::bail!("timeout");
+            }
+        }
     }
 
     #[inline]
@@ -290,7 +326,13 @@ impl Client {
             &self.state.cb_create_room,
         )
         .await?;
-        let me = self.state.me.read().await.clone().unwrap();
+        let me = self
+            .state
+            .me
+            .read()
+            .await
+            .clone()
+            .context("not authenticated")?;
         *self.state.room.write().await = Some(ClientRoomState {
             id,
             state: RoomState::default(),
@@ -364,7 +406,9 @@ impl Client {
     pub async fn request_start(&self) -> Result<()> {
         self.rcall(ClientCommand::RequestStart, &self.state.cb_request_start)
             .await?;
-        self.state.room.write().await.as_mut().unwrap().is_ready = true;
+        if let Some(room) = self.state.room.write().await.as_mut() {
+            room.is_ready = true;
+        }
         Ok(())
     }
 
@@ -372,7 +416,9 @@ impl Client {
     pub async fn ready(&self) -> Result<()> {
         self.rcall(ClientCommand::Ready, &self.state.cb_ready)
             .await?;
-        self.state.room.write().await.as_mut().unwrap().is_ready = true;
+        if let Some(room) = self.state.room.write().await.as_mut() {
+            room.is_ready = true;
+        }
         Ok(())
     }
 
@@ -380,7 +426,9 @@ impl Client {
     pub async fn cancel_ready(&self) -> Result<()> {
         self.rcall(ClientCommand::CancelReady, &self.state.cb_cancel_ready)
             .await?;
-        self.state.room.write().await.as_mut().unwrap().is_ready = false;
+        if let Some(room) = self.state.room.write().await.as_mut() {
+            room.is_ready = false;
+        }
         Ok(())
     }
 
@@ -419,13 +467,56 @@ impl Drop for Client {
     }
 }
 
+async fn wait_until_closed(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+async fn send_ping(
+    state: &State,
+    stream: &Stream<ClientCommand, ServerCommand>,
+) -> Result<Duration> {
+    let _ping_guard = state.ping_lock.lock().await;
+    let (tx, rx) = oneshot::channel();
+    *state.pong_tx.lock().await = Some(tx);
+    let start = Instant::now();
+    if let Err(err) = stream.send(ClientCommand::Ping).await {
+        *state.pong_tx.lock().await = None;
+        return Err(err);
+    }
+    match time::timeout(HEARTBEAT_TIMEOUT, rx).await {
+        Ok(Ok(())) => {
+            let delay = start.elapsed();
+            *state.delay.lock().await = Some(delay);
+            Ok(delay)
+        }
+        Ok(Err(_)) => Err(Error::msg("ping response channel closed")),
+        Err(_) => {
+            *state.pong_tx.lock().await = None;
+            anyhow::bail!("heartbeat timeout");
+        }
+    }
+}
+
 async fn process(state: Arc<State>, cmd: ServerCommand) {
-    async fn cb<T>(cb: &Callback<T>, res: T) {
-        let _ = cb.lock().await.take().unwrap().send(res);
+    async fn cb<T>(cb: &CallbackSlot<T>, res: T) {
+        if let Some(tx) = cb.tx.lock().await.take() {
+            let _ = tx.send(res);
+        } else {
+            warn!("received unexpected callback response");
+        }
     }
     match cmd {
         ServerCommand::Pong => {
-            state.ping_notify.notify_one();
+            if let Some(tx) = state.pong_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
         }
         ServerCommand::Authenticate(res) => {
             cb(&state.cb_authenticate, res).await;
@@ -452,34 +543,40 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
         ServerCommand::Message(msg) => {
             match msg {
                 Message::LockRoom { lock } => {
-                    state.room.write().await.as_mut().unwrap().locked = lock;
+                    if let Some(room) = state.room.write().await.as_mut() {
+                        room.locked = lock;
+                    }
                 }
                 Message::CycleRoom { cycle } => {
-                    state.room.write().await.as_mut().unwrap().cycle = cycle;
+                    if let Some(room) = state.room.write().await.as_mut() {
+                        room.cycle = cycle;
+                    }
                 }
                 Message::LeaveRoom { user, .. } => {
-                    state
-                        .room
-                        .write()
-                        .await
-                        .as_mut()
-                        .unwrap()
-                        .users
-                        .remove(&user);
+                    if let Some(room) = state.room.write().await.as_mut() {
+                        room.users.remove(&user);
+                    }
                 }
                 _ => {}
             }
-            state.messages.lock().await.push(msg);
+            let mut messages = state.messages.lock().await;
+            if messages.len() >= MAX_QUEUED_MESSAGES {
+                let drain_count = messages.len() - (MAX_QUEUED_MESSAGES - 1);
+                messages.drain(..drain_count);
+            }
+            messages.push(msg);
         }
         ServerCommand::ChangeState(room) => {
             state.live_players.clear();
-            let mut guard = state.room.write().await;
-            let state = guard.as_mut().unwrap();
-            state.state = room;
-            state.is_ready = state.is_host;
+            if let Some(room_state) = state.room.write().await.as_mut() {
+                room_state.state = room;
+                room_state.is_ready = room_state.is_host;
+            }
         }
         ServerCommand::ChangeHost(me_is_host) => {
-            state.room.write().await.as_mut().unwrap().is_host = me_is_host;
+            if let Some(room) = state.room.write().await.as_mut() {
+                room.is_host = me_is_host;
+            }
         }
 
         ServerCommand::CreateRoom(res) => {

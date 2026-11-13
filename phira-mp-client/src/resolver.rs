@@ -5,6 +5,7 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 use http::uri::Authority;
+use std::cmp::Reverse;
 use std::net::IpAddr;
 use std::sync::LazyLock;
 
@@ -44,7 +45,7 @@ async fn resolve_srv(host: &str) -> Result<(String, u16)> {
 
     let srv = lookup
         .iter()
-        .next()
+        .min_by_key(|srv| (srv.priority(), Reverse(srv.weight())))
         .ok_or_else(|| anyhow::anyhow!("No SRV records found"))?;
 
     let target = srv.target().to_string().trim_end_matches('.').to_string();
