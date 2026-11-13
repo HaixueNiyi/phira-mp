@@ -75,7 +75,6 @@ ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferr
 #### 监控
 您可以检查正在运行的进程及其正在侦听的端口：
 ```shell
-ps -aux | grep phira-mp-server
-netstat -tuln | grep 12346
+ps aux | grep phira-mp-server
+ss -tuln | grep 12346
 ```
-![result](https://i.imgur.com/NXC54ZZ.png)

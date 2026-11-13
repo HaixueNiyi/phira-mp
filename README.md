@@ -78,8 +78,7 @@ ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferr
 #### Monitoring
 You can check the running process and the port it's listening on with:
 ```shell
-ps -aux | grep phira-mp-server
-netstat -tuln | grep 12346
+ps aux | grep phira-mp-server
+ss -tuln | grep 12346
 ```
-![result](https://github.com/YuevUwU/phira-mp/assets/96368079/bb25398b-75af-47c3-8ba4-e609be26177b)
 
