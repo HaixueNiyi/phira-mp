@@ -1,6 +1,6 @@
 use std::{collections::HashMap, hash::Hash};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian as LE};
 use chrono::{DateTime, TimeZone, Utc};
 use tap::TapFallible;
@@ -18,8 +18,21 @@ impl<'a> BinaryReader<'a> {
         Self(data, 0)
     }
 
+    pub fn remaining(&self) -> usize {
+        self.0.len().saturating_sub(self.1)
+    }
+
     pub fn array<T: BinaryData>(&mut self) -> Result<Vec<T>> {
-        (0..self.uleb()?).map(|_| self.read()).collect()
+        let count = usize::try_from(self.uleb()?).map_err(|_| anyhow!("array too large"))?;
+        let mut res = Vec::with_capacity(count.min(self.remaining()).min(1024));
+        for idx in 0..count {
+            let before = self.1;
+            res.push(self.read()?);
+            if idx == 0 && self.1 == before && count > 1024 {
+                bail!("zero-sized array count too large");
+            }
+        }
+        Ok(res)
     }
 
     pub fn byte(&mut self) -> Result<u8> {
@@ -31,10 +44,14 @@ impl<'a> BinaryReader<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .1
+            .checked_add(n)
+            .ok_or_else(|| anyhow!("unexpected EOF"))?;
         self.0
-            .get(self.1..(self.1 + n))
+            .get(self.1..end)
             .ok_or_else(|| anyhow!("unexpected EOF"))
-            .tap_ok(|_| self.1 += n)
+            .tap_ok(|_| self.1 = end)
     }
 
     pub fn read<T: BinaryData>(&mut self) -> Result<T> {
@@ -42,16 +59,20 @@ impl<'a> BinaryReader<'a> {
     }
 
     pub fn uleb(&mut self) -> Result<u64> {
-        let mut result = 0;
-        let mut shift = 0;
-        loop {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..10 {
             let byte = self.read::<u8>()?;
+            if shift == 63 && byte > 1 {
+                bail!("uleb overflow");
+            }
             result |= ((byte & 0x7f) as u64) << shift;
             if byte & 0x80 == 0 {
-                break Ok(result);
+                return Ok(result);
             }
             shift += 7;
         }
+        bail!("uleb overflow");
     }
 }
 
@@ -184,7 +205,11 @@ impl BinaryData for i64 {
 
 impl BinaryData for bool {
     fn read_binary(r: &mut BinaryReader<'_>) -> Result<Self> {
-        Ok(r.byte()? == 1)
+        match r.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            b => bail!("invalid bool: {b}"),
+        }
     }
 
     fn write_binary(&self, w: &mut BinaryWriter<'_>) -> Result<()> {
@@ -205,8 +230,10 @@ impl BinaryData for f32 {
 
 impl BinaryData for String {
     fn read_binary(r: &mut BinaryReader<'_>) -> Result<Self> {
-        let len = r.uleb()? as usize;
-        Ok(String::from_utf8_lossy(r.take(len)?).into_owned())
+        let len = usize::try_from(r.uleb()?).map_err(|_| anyhow!("string too large"))?;
+        Ok(std::str::from_utf8(r.take(len)?)
+            .map_err(|_| anyhow!("invalid utf-8"))?
+            .to_owned())
     }
 
     fn write_binary(&self, w: &mut BinaryWriter<'_>) -> Result<()> {
@@ -287,7 +314,17 @@ impl<T: BinaryData> BinaryData for Vec<T> {
 
 impl<K: BinaryData + Eq + Hash, V: BinaryData> BinaryData for HashMap<K, V> {
     fn read_binary(r: &mut BinaryReader<'_>) -> Result<Self> {
-        (0..r.uleb()?).map(|_| r.read::<(K, V)>()).collect()
+        let count = usize::try_from(r.uleb()?).map_err(|_| anyhow!("map too large"))?;
+        let mut res = HashMap::with_capacity(count.min(r.remaining()).min(1024));
+        for idx in 0..count {
+            let before = r.remaining();
+            let (k, v) = r.read::<(K, V)>()?;
+            if idx == 0 && r.remaining() == before && count > 1024 {
+                bail!("zero-sized map count too large");
+            }
+            res.insert(k, v);
+        }
+        Ok(res)
     }
 
     fn write_binary(&self, w: &mut BinaryWriter<'_>) -> Result<()> {

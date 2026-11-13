@@ -75,16 +75,21 @@ fn build_derive(name: Ident, data: Data) -> TokenStream {
 }
 
 fn build_derive_struct(name: Ident, fields: Fields) -> TokenStream {
-    let fields: Vec<_> = fields
+    let field_infos: Vec<_> = fields
         .iter()
         .map(|it| (it.ident.clone(), parse_type(&it.ty)))
         .collect();
-    let read = struct_read(&fields);
-    let write = struct_write(&fields, true);
+    let read = struct_read(&field_infos);
+    let write = struct_write(&field_infos, true);
+    let construct = match fields {
+        Fields::Named(_) => quote! { Self { #read } },
+        Fields::Unnamed(_) => quote! { Self(#read) },
+        Fields::Unit => quote! { Self },
+    };
     quote! {
         impl crate::BinaryData for #name {
             fn read_binary(r: &mut crate::BinaryReader<'_>) -> Result<Self> {
-                Ok(Self { #read })
+                Ok(#construct)
             }
 
             fn write_binary(&self, w: &mut crate::BinaryWriter<'_>) -> Result<()> {
@@ -100,7 +105,7 @@ fn build_derive_enum(name: Ident, variants: Vec<Variant>) -> TokenStream {
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let i = i as u8;
+            let i = u8::try_from(i).expect("enum with more than 256 variants is not supported");
             let name = &it.ident;
             match &it.fields {
                 Fields::Unit => quote! { #i => Self::#name },
@@ -130,7 +135,7 @@ fn build_derive_enum(name: Ident, variants: Vec<Variant>) -> TokenStream {
             quote! { x => anyhow::bail!("invalid enum: {}", x) },
         ));
     let write_arms = variants.iter().enumerate().map(|(i, it)| {
-        let i = i as u8;
+        let i = u8::try_from(i).expect("enum with more than 256 variants is not supported");
         let name = &it.ident;
         match &it.fields {
             Fields::Unit => quote! { Self::#name => w.write_val(#i)? },
@@ -216,11 +221,11 @@ fn struct_write(fields: &[(Option<Ident>, TypeInfo)], use_self: bool) -> TokenSt
         .map(|(i, (name, typ))| {
             field_write(
                 if use_self {
-                    let i = i as u8;
                     if let Some(name) = name {
                         quote! { &self.#name }
                     } else {
-                        quote! { &self.#i }
+                        let idx = syn::Index::from(i);
+                        quote! { &self.#idx }
                     }
                 } else {
                     let name = name

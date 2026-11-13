@@ -1,5 +1,5 @@
 use crate::{BinaryData, BinaryReader, BinaryWriter};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use half::f16;
 use phira_mp_macros::BinaryData;
 use std::{collections::HashMap, fmt::Display, sync::Arc};
@@ -63,11 +63,15 @@ impl<const N: usize> TryFrom<String> for Varchar<N> {
 }
 impl<const N: usize> BinaryData for Varchar<N> {
     fn read_binary(r: &mut BinaryReader<'_>) -> Result<Self> {
-        let len = r.uleb()? as usize;
+        let len = usize::try_from(r.uleb()?).map_err(|_| anyhow!("string too long"))?;
         if len > N {
             bail!("string too long");
         }
-        Ok(Varchar(String::from_utf8_lossy(r.take(len)?).into_owned()))
+        Ok(Varchar(
+            std::str::from_utf8(r.take(len)?)
+                .map_err(|_| anyhow!("invalid utf-8"))?
+                .to_owned(),
+        ))
     }
 
     fn write_binary(&self, w: &mut BinaryWriter<'_>) -> Result<()> {
