@@ -1,6 +1,7 @@
 [workspace.package]
 license-file = "LICENSE"
 edition = "2024"
+repository = "https://github.com/HaixueNiyi/phira-mp"
 
 [workspace]
 members = [
