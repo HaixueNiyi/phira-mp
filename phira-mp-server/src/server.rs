@@ -59,14 +59,14 @@ pub struct ServerState {
 }
 
 pub struct Server {
-    state: Arc<ServerState>,
+    pub(crate) state: Arc<ServerState>,
     listener: TcpListener,
     lost_con_handle: JoinHandle<()>,
 }
 
 impl From<TcpListener> for Server {
     fn from(listener: TcpListener) -> Self {
-        let (lost_con_tx, mut lost_con_rx) = mpsc::channel(16);
+        let (lost_con_tx, mut lost_con_rx) = mpsc::channel(256);
         let config: ServerConfig = File::open("server_config.yml")
             .ok()
             .and_then(|f| serde_yaml::from_reader(f).ok())
@@ -91,18 +91,26 @@ impl From<TcpListener> for Server {
             let state = Arc::clone(&state);
             async move {
                 while let Some(id) = lost_con_rx.recv().await {
-                    warn!("lost connection with {id}");
-                    if let Some(session) = state.sessions.write().await.remove(&id)
-                        && session
-                            .user
-                            .session
-                            .read()
-                            .await
-                            .as_ref()
-                            .is_some_and(|it| it.ptr_eq(&Arc::downgrade(&session)))
-                    {
-                        Arc::clone(&session.user).dangle().await;
-                    }
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        warn!("lost connection with {id}");
+                        let session = state.sessions.write().await.remove(&id);
+                        if let Some(session) = session {
+                            session.mark_lost();
+                            let is_current = session
+                                .user
+                                .session
+                                .read()
+                                .await
+                                .as_ref()
+                                .is_some_and(|it| it.ptr_eq(&Arc::downgrade(&session)));
+                            if is_current {
+                                Arc::clone(&session.user)
+                                    .dangle_for_session(session.id)
+                                    .await;
+                            }
+                        }
+                    });
                 }
             }
         });
@@ -137,7 +145,6 @@ impl Server {
                         session.id,
                         session.version()
                     );
-                    state.sessions.write().await.insert(session.id, session);
                 }
                 Err(err) => {
                     warn!("failed to accept connection from {addr} ({id}): {err:?}");
@@ -243,5 +250,19 @@ mod tests {
             ping_roundtrip(addr, Duration::from_millis(500)).await,
             "client was not served after unauthenticated slots were freed"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_protocol_version_promptly() {
+        let (addr, _server) = start_server().await;
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        // Send unsupported protocol version 99.
+        conn.write_all(&[99]).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = timeout(Duration::from_millis(500), conn.read(&mut buf))
+            .await
+            .expect("unsupported version connection was not closed promptly")
+            .unwrap();
+        assert_eq!(n, 0, "expected EOF for unsupported protocol version");
     }
 }
