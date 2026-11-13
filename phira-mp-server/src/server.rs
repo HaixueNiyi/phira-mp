@@ -1,8 +1,8 @@
 use crate::{IdMap, Room, SafeMap, Session, User, vacant_entry};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use phira_mp_common::RoomId;
 use serde::Deserialize;
-use std::{fs::File, sync::Arc, time::Duration};
+use std::{fs::File, io, path::Path, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, mpsc},
@@ -64,13 +64,31 @@ pub struct Server {
     lost_con_handle: JoinHandle<()>,
 }
 
+pub fn load_server_config(path: &Path) -> Result<ServerConfig> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            warn!("{} not found; using default configuration", path.display());
+            return Ok(ServerConfig::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to open {}", path.display()));
+        }
+    };
+    serde_yaml::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
+}
+
 impl From<TcpListener> for Server {
     fn from(listener: TcpListener) -> Self {
+        let config =
+            load_server_config(Path::new("server_config.yml")).expect("invalid server_config.yml");
+        Self::from_config(listener, config)
+    }
+}
+
+impl Server {
+    pub fn from_config(listener: TcpListener, config: ServerConfig) -> Self {
         let (lost_con_tx, mut lost_con_rx) = mpsc::channel(256);
-        let config: ServerConfig = File::open("server_config.yml")
-            .ok()
-            .and_then(|f| serde_yaml::from_reader(f).ok())
-            .unwrap_or_default();
         let http_client = reqwest::Client::builder()
             .timeout(AUTH_HTTP_TIMEOUT)
             .connect_timeout(AUTH_HTTP_TIMEOUT)
@@ -264,5 +282,21 @@ mod tests {
             .expect("unsupported version connection was not closed promptly")
             .unwrap();
         assert_eq!(n, 0, "expected EOF for unsupported protocol version");
+    }
+
+    #[test]
+    fn load_server_config_rejects_malformed_yaml_and_falls_back_on_missing() {
+        let missing = std::env::temp_dir().join(format!("phira_mp_missing_{}.yml", Uuid::new_v4()));
+        let cfg = load_server_config(&missing).unwrap();
+        assert_eq!(cfg.monitors, vec![2]);
+
+        let malformed = std::env::temp_dir().join(format!("phira_mp_bad_{}.yml", Uuid::new_v4()));
+        std::fs::write(&malformed, "monitors: [not_an_int").unwrap();
+        let res = load_server_config(&malformed);
+        let _ = std::fs::remove_file(&malformed);
+        assert!(
+            res.is_err(),
+            "malformed YAML must return Err instead of silently granting defaults"
+        );
     }
 }

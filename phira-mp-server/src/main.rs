@@ -16,8 +16,9 @@ use std::{
         HashMap,
         hash_map::{Entry, VacantEntry},
     },
-    net::{Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
+    time::Duration,
 };
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{metadata::LevelFilter, warn};
@@ -30,7 +31,6 @@ pub type IdMap<V> = SafeMap<Uuid, V>;
 fn vacant_entry<V>(map: &mut HashMap<Uuid, V>) -> VacantEntry<'_, Uuid, V> {
     let mut id = Uuid::new_v4();
     while map.contains_key(&id) {
-        // 修正此处的语法错误
         id = Uuid::new_v4();
     }
     match map.entry(id) {
@@ -76,7 +76,6 @@ pub fn init_log(file: &str, level: LevelFilter, max_files: usize) -> Result<Work
             filter::Targets::new()
                 .with_target("hyper", Level::INFO)
                 .with_target("rustls", Level::INFO)
-                .with_target("isahc", Level::INFO)
                 .with_default(Level::TRACE),
         );
 
@@ -98,6 +97,12 @@ struct Args {
 
     #[clap(
         long,
+        help = "Bind IP address (defaults to :: with fallback to 0.0.0.0)"
+    )]
+    bind: Option<IpAddr>,
+
+    #[clap(
+        long,
         default_value_t = LevelFilter::DEBUG,
         help = "Maximum level written to the log file (off, error, warn, info, debug, trace)"
     )]
@@ -111,24 +116,36 @@ struct Args {
     log_max_files: usize,
 }
 
+async fn bind_listener(bind: Option<IpAddr>, port: u16) -> Result<TcpListener> {
+    if let Some(ip) = bind {
+        return Ok(TcpListener::bind(SocketAddr::new(ip, port)).await?);
+    }
+    let v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+    match TcpListener::bind(v6).await {
+        Ok(listener) => Ok(listener),
+        Err(err) => {
+            let v4 = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
+            warn!("failed to bind {v6} ({err}); falling back to {v4}");
+            Ok(TcpListener::bind(v4).await?)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let _guard = init_log("phira-mp", args.log_level, args.log_max_files)?;
+    let config = load_server_config(Path::new("server_config.yml"))?;
 
-    let port = args.port;
-    let addrs: &[SocketAddr] = &[SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)];
+    let tcp_listener = bind_listener(args.bind, args.port).await?;
+    println!("Local Address: {}", tcp_listener.local_addr()?);
 
-    // 打印本地地址和端口
-    for addr in addrs {
-        println!("Local Address: {}", addr);
-    }
-
-    let listener: Server = TcpListener::bind(addrs).await?.into();
+    let server = Server::from_config(tcp_listener, config);
 
     loop {
-        if let Err(err) = listener.accept().await {
+        if let Err(err) = server.accept().await {
             warn!("failed to accept: {err:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -141,6 +158,7 @@ mod tests {
     fn log_args_defaults_keep_previous_behaviour() {
         let args = Args::try_parse_from(["phira-mp-server"]).unwrap();
         assert_eq!(args.port, 12346);
+        assert!(args.bind.is_none());
         assert_eq!(args.log_level, LevelFilter::DEBUG);
         assert_eq!(args.log_max_files, 168);
     }
@@ -149,12 +167,15 @@ mod tests {
     fn log_args_are_configurable() {
         let args = Args::try_parse_from([
             "phira-mp-server",
+            "--bind",
+            "127.0.0.1",
             "--log-level",
             "warn",
             "--log-max-files",
             "0",
         ])
         .unwrap();
+        assert_eq!(args.bind, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(args.log_level, LevelFilter::WARN);
         assert_eq!(args.log_max_files, 0);
     }
@@ -162,5 +183,20 @@ mod tests {
     #[test]
     fn invalid_log_level_is_rejected() {
         assert!(Args::try_parse_from(["phira-mp-server", "--log-level", "loud"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_listener_binds_explicit_and_default_addresses() {
+        let l1 = bind_listener(Some("127.0.0.1".parse().unwrap()), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            l1.local_addr().unwrap().ip(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        drop(l1);
+
+        let l2 = bind_listener(None, 0).await.unwrap();
+        assert!(l2.local_addr().unwrap().port() > 0);
     }
 }
