@@ -177,11 +177,15 @@ impl Client {
                                 break;
                             }
                             warn!("heartbeat timeout or error: {err:?}");
-                            let _ = ping_fail_count.fetch_update(
+                            let mut cur = ping_fail_count.load(Ordering::Relaxed);
+                            while let Err(next) = ping_fail_count.compare_exchange_weak(
+                                cur,
+                                cur.saturating_add(1),
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
-                                |cur| Some(cur.saturating_add(1)),
-                            );
+                            ) {
+                                cur = next;
+                            }
                         }
                     }
                 }
