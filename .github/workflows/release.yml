@@ -3,7 +3,21 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ vars.RUST_TOOLCHAIN || 'stable' }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --locked --workspace --all-targets
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -13,23 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Write Cross.toml
-        run: |
-          cat > Cross.toml <<'EOF'
-          [target.x86_64-unknown-linux-gnu]
-          pre-build = [
-              "dpkg --add-architecture $CROSS_DEB_ARCH",
-              "apt-get update && apt-get install --assume-yes pkg-config libssl-dev:$CROSS_DEB_ARCH"
-          ]
-          [target.aarch64-unknown-linux-gnu]
-          pre-build = [
-              "dpkg --add-architecture $CROSS_DEB_ARCH",
-              "apt-get update && apt-get install --assume-yes pkg-config libssl-dev:$CROSS_DEB_ARCH"
-          ]
-          EOF
-
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ vars.RUST_TOOLCHAIN || 'stable' }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -37,10 +37,10 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross --version 0.2.5
+        run: cargo install cross --locked --version 0.2.5
 
       - name: Build ${{ matrix.target }}
-        run: cross build --release --workspace --target ${{ matrix.target }}
+        run: cross build --locked --release --workspace --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -54,8 +54,10 @@ jobs:
           path: dist/phira-mp-server-${{ matrix.target }}.tar.gz
 
   publish:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4
