@@ -10,9 +10,9 @@
 ## 服务端安装
 ### 对于 `Linux` 用户
 #### 依赖
-首先，如果尚未安装 Rust，请安装。 您可以按照 https://www.rust-lang.org/tools/install 中的说明进行操作
+需要 `git`、`curl` 与 Rust 1.88 或更高版本（可通过 `rustup` 安装：https://www.rust-lang.org/tools/install ）。
 
-对于 Ubuntu 或 Debian 用户，如果尚未安装 `curl` 与 `git`，请使用以下命令进行安装：
+对于 Ubuntu 或 Debian 用户，可使用以下命令安装 `curl` 与 `git`：
 
 ```shell
 sudo apt install curl git
@@ -21,7 +21,11 @@ sudo apt install curl git
 ```shell
 sudo yum install curl git
 ```
-安装 curl 后，使用以下命令安装 Rust：
+对于 Arch Linux 用户，可使用以下命令安装 `curl` 与 `git`（也可以直接运行 `sudo pacman -S --needed rustup git && rustup default stable`）：
+```shell
+sudo pacman -S --needed curl git
+```
+安装 `curl` 后，使用以下命令安装 Rust（若上面已通过 `rustup` 安装则可跳过）：
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
@@ -66,7 +70,7 @@ ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferr
 `docker build --tag phira-mp .`
 
 3. 运行容器
-`docker run -it --name phira-mp -p <prefered-port>:<preferred-port> --restart=unless-stopped phira-mp`
+`docker run -it --name phira-mp -p <preferred-port>:<preferred-port> --restart=unless-stopped phira-mp`
 
 #### 监控
 您可以检查正在运行的进程及其正在侦听的端口：
@@ -75,6 +79,3 @@ ps -aux | grep phira-mp-server
 netstat -tuln | grep 12346
 ```
 ![result](https://i.imgur.com/NXC54ZZ.png)
-
-## 对于 Windows 或 Android 用户
-查看: [https://docs.qq.com/doc/DU1dlekx3U096REdD](https://docs.qq.com/doc/DU1dlekx3U096REdD)

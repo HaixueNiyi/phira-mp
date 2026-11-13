@@ -13,9 +13,9 @@
 ### For Linux
 
 #### Dependent
-First, install Rust if you haven't already. You can do so by following the instructions at https://www.rust-lang.org/tools/install
+You will need `git`, `curl`, and Rust 1.88+ (`rustup`: https://www.rust-lang.org/tools/install).
 
-For Ubuntu or Debian users, use the following command to install `curl` and `git` if they aren't installed yet:
+For Ubuntu or Debian users, install `curl` and `git` with:
 
 ```shell
 sudo apt install curl git
@@ -24,11 +24,15 @@ For Fedora or CentOS users, use the following command:
 ```shell
 sudo yum install curl git
 ```
-After curl is installed, install Rust with the following command:
+For Arch Linux users, install `curl` and `git` (or install Rust directly via `sudo pacman -S --needed rustup git && rustup default stable`):
+```shell
+sudo pacman -S --needed curl git
+```
+After `curl` is installed, install Rust with the following command (skip if you already installed it via `rustup` above):
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-Then, clone this fork and build the server:
+Then clone this repository and build the server:
 ```shell
 git clone https://github.com/HaixueNiyi/phira-mp
 cd phira-mp
@@ -69,7 +73,7 @@ ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferr
 `docker build --tag phira-mp .`
 
 3. Run the container
-`docker run -it --name phira-mp -p <prefered-port>:<preferred-port> --restart=unless-stopped phira-mp`
+`docker run -it --name phira-mp -p <preferred-port>:<preferred-port> --restart=unless-stopped phira-mp`
 
 #### Monitoring
 You can check the running process and the port it's listening on with:
@@ -78,8 +82,4 @@ ps -aux | grep phira-mp-server
 netstat -tuln | grep 12346
 ```
 ![result](https://github.com/YuevUwU/phira-mp/assets/96368079/bb25398b-75af-47c3-8ba4-e609be26177b)
-
-
-## For Windows or Android
-View: [https://docs.qq.com/doc/DU1dlekx3U096REdD](https://docs.qq.com/doc/DU1dlekx3U096REdD)
 
