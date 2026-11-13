@@ -85,6 +85,8 @@ struct State {
 
     live_players: DashMap<i32, Arc<LivePlayer>>,
     messages: Mutex<Vec<Message>>,
+    pending_create_id: Mutex<Option<RoomId>>,
+    pending_join_id: Mutex<Option<RoomId>>,
 }
 
 impl State {
@@ -135,6 +137,8 @@ impl Client {
 
             live_players: DashMap::new(),
             messages: Mutex::default(),
+            pending_create_id: Mutex::default(),
+            pending_join_id: Mutex::default(),
         });
         let stream = Arc::new(
             Stream::new(
@@ -275,8 +279,7 @@ impl Client {
         *self.state.delay.blocking_lock()
     }
 
-    async fn rcall<R>(&self, payload: ClientCommand, cb: &RCallback<R>) -> Result<R> {
-        let _call_guard = cb.call_lock.lock().await;
+    async fn rcall_locked<R>(&self, payload: ClientCommand, cb: &RCallback<R>) -> Result<R> {
         let (tx, rx) = oneshot::channel();
         *cb.tx.lock().await = Some(tx);
         if let Err(err) = self.stream.send(payload).await {
@@ -293,9 +296,14 @@ impl Client {
         }
     }
 
+    async fn rcall<R>(&self, payload: ClientCommand, cb: &RCallback<R>) -> Result<R> {
+        let _call_guard = cb.call_lock.lock().await;
+        self.rcall_locked(payload, cb).await
+    }
+
     #[inline]
     pub async fn authenticate(&self, token: impl Into<String>) -> Result<()> {
-        let (me, room) = self
+        let _ = self
             .rcall(
                 ClientCommand::Authenticate {
                     token: token.into().try_into()?,
@@ -303,8 +311,6 @@ impl Client {
                 &self.state.cb_authenticate,
             )
             .await?;
-        *self.state.me.write().await = Some(me);
-        *self.state.room.write().await = room;
         Ok(())
     }
 
@@ -321,61 +327,37 @@ impl Client {
 
     #[inline]
     pub async fn create_room(&self, id: RoomId) -> Result<()> {
-        self.rcall(
-            ClientCommand::CreateRoom { id: id.clone() },
-            &self.state.cb_create_room,
-        )
-        .await?;
-        let me = self
-            .state
-            .me
-            .read()
-            .await
-            .clone()
-            .context("not authenticated")?;
-        *self.state.room.write().await = Some(ClientRoomState {
-            id,
-            state: RoomState::default(),
-            live: false,
-            locked: false,
-            cycle: false,
-            is_host: true,
-            is_ready: false,
-            users: std::iter::once((me.id, me)).collect(),
-        });
-        Ok(())
+        let _call_guard = self.state.cb_create_room.call_lock.lock().await;
+        *self.state.pending_create_id.lock().await = Some(id.clone());
+        let res = self
+            .rcall_locked(ClientCommand::CreateRoom { id }, &self.state.cb_create_room)
+            .await;
+        if res.is_err() {
+            *self.state.pending_create_id.lock().await = None;
+        }
+        res
     }
 
     #[inline]
     pub async fn join_room(&self, id: RoomId, monitor: bool) -> Result<()> {
-        let resp = self
-            .rcall(
-                ClientCommand::JoinRoom {
-                    id: id.clone(),
-                    monitor,
-                },
+        let _call_guard = self.state.cb_join_room.call_lock.lock().await;
+        *self.state.pending_join_id.lock().await = Some(id.clone());
+        let res = self
+            .rcall_locked(
+                ClientCommand::JoinRoom { id, monitor },
                 &self.state.cb_join_room,
             )
-            .await?;
-        *self.state.room.write().await = Some(ClientRoomState {
-            id,
-            state: resp.state,
-            live: resp.live,
-            locked: false,
-            cycle: false,
-            is_host: false,
-            is_ready: false,
-            users: resp.users.into_iter().map(|it| (it.id, it)).collect(),
-        });
-        Ok(())
+            .await;
+        if res.is_err() {
+            *self.state.pending_join_id.lock().await = None;
+        }
+        res.map(|_| ())
     }
 
     #[inline]
     pub async fn leave_room(&self) -> Result<()> {
         self.rcall(ClientCommand::LeaveRoom, &self.state.cb_leave_room)
-            .await?;
-        *self.state.room.write().await = None;
-        Ok(())
+            .await
     }
 
     #[inline]
@@ -405,31 +387,18 @@ impl Client {
     #[inline]
     pub async fn request_start(&self) -> Result<()> {
         self.rcall(ClientCommand::RequestStart, &self.state.cb_request_start)
-            .await?;
-        if let Some(room) = self.state.room.write().await.as_mut() {
-            room.is_ready = true;
-        }
-        Ok(())
+            .await
     }
 
     #[inline]
     pub async fn ready(&self) -> Result<()> {
-        self.rcall(ClientCommand::Ready, &self.state.cb_ready)
-            .await?;
-        if let Some(room) = self.state.room.write().await.as_mut() {
-            room.is_ready = true;
-        }
-        Ok(())
+        self.rcall(ClientCommand::Ready, &self.state.cb_ready).await
     }
 
     #[inline]
     pub async fn cancel_ready(&self) -> Result<()> {
         self.rcall(ClientCommand::CancelReady, &self.state.cb_cancel_ready)
-            .await?;
-        if let Some(room) = self.state.room.write().await.as_mut() {
-            room.is_ready = false;
-        }
-        Ok(())
+            .await
     }
 
     #[inline]
@@ -519,6 +488,15 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
             }
         }
         ServerCommand::Authenticate(res) => {
+            let res = match res {
+                Ok((me, room)) => {
+                    *state.me.write().await = Some(me.clone());
+                    *state.room.write().await = room.clone();
+                    state.live_players.clear();
+                    Ok((me, room))
+                }
+                Err(err) => Err(err),
+            };
             cb(&state.cb_authenticate, res).await;
         }
         ServerCommand::Chat(res) => {
@@ -553,6 +531,7 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
                     }
                 }
                 Message::LeaveRoom { user, .. } => {
+                    state.live_players.remove(&user);
                     if let Some(room) = state.room.write().await.as_mut() {
                         room.users.remove(&user);
                     }
@@ -580,9 +559,61 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
         }
 
         ServerCommand::CreateRoom(res) => {
+            let res = match res {
+                Ok(()) => {
+                    let id = state.pending_create_id.lock().await.take();
+                    let me = state.me.read().await.clone();
+                    match (id, me) {
+                        (Some(id), Some(me)) => {
+                            state.live_players.clear();
+                            *state.room.write().await = Some(ClientRoomState {
+                                id,
+                                state: RoomState::default(),
+                                live: false,
+                                locked: false,
+                                cycle: false,
+                                is_host: true,
+                                is_ready: false,
+                                users: std::iter::once((me.id, me)).collect(),
+                            });
+                            Ok(())
+                        }
+                        (None, _) => Err("missing pending room id".to_owned()),
+                        (_, None) => Err("not authenticated".to_owned()),
+                    }
+                }
+                Err(err) => {
+                    *state.pending_create_id.lock().await = None;
+                    Err(err)
+                }
+            };
             cb(&state.cb_create_room, res).await;
         }
         ServerCommand::JoinRoom(res) => {
+            let res = match res {
+                Ok(resp) => {
+                    if let Some(id) = state.pending_join_id.lock().await.take() {
+                        state.live_players.clear();
+                        *state.room.write().await = Some(ClientRoomState {
+                            id,
+                            state: resp.state,
+                            live: resp.live,
+                            locked: false,
+                            cycle: false,
+                            is_host: false,
+                            is_ready: false,
+                            users: resp.users.iter().cloned().map(|it| (it.id, it)).collect(),
+                        });
+                        Ok(resp)
+                    } else {
+                        Err("missing pending room id".to_owned())
+                    }
+                }
+                Err(err) => {
+                    *state.pending_join_id.lock().await = None;
+                    Err(err)
+                }
+            };
             cb(&state.cb_join_room, res).await;
         }
         ServerCommand::OnJoinRoom(user) => {
@@ -592,6 +623,10 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
             }
         }
         ServerCommand::LeaveRoom(res) => {
+            if res.is_ok() {
+                *state.room.write().await = None;
+                state.live_players.clear();
+            }
             cb(&state.cb_leave_room, res).await;
         }
         ServerCommand::LockRoom(res) => {
@@ -604,12 +639,27 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
             cb(&state.cb_select_chart, res).await;
         }
         ServerCommand::RequestStart(res) => {
+            if res.is_ok()
+                && let Some(room) = state.room.write().await.as_mut()
+            {
+                room.is_ready = true;
+            }
             cb(&state.cb_request_start, res).await;
         }
         ServerCommand::Ready(res) => {
+            if res.is_ok()
+                && let Some(room) = state.room.write().await.as_mut()
+            {
+                room.is_ready = true;
+            }
             cb(&state.cb_ready, res).await;
         }
         ServerCommand::CancelReady(res) => {
+            if res.is_ok()
+                && let Some(room) = state.room.write().await.as_mut()
+            {
+                room.is_ready = false;
+            }
             cb(&state.cb_cancel_ready, res).await;
         }
         ServerCommand::Played(res) => {
