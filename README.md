@@ -1,6 +1,6 @@
 # phira-mp
 
-`phira-mp` is a project developed with Rust. Below are the steps to deploy and run this project.
+`phira-mp` is a multiplayer server and client library for Phira developed with Rust. This repository is a hardened personal fork of [TeamFlos/phira-mp](https://github.com/TeamFlos/phira-mp) with security, concurrency, lifecycle, and stability fixes while maintaining wire-protocol compatibility.
 
 [简体中文](README.zh-CN.md) | English Version
 
@@ -15,22 +15,24 @@
 #### Dependent
 First, install Rust if you haven't already. You can do so by following the instructions at https://www.rust-lang.org/tools/install
 
-For Ubuntu or Debian users, use the following command to install `curl` if it isn't installed yet:
+For Ubuntu or Debian users, use the following command to install `curl` and `git` if they aren't installed yet:
 
 ```shell
-sudo apt install curl
+sudo apt install curl git
 ```
 For Fedora or CentOS users, use the following command:
 ```shell
-sudo yum install curl
+sudo yum install curl git
 ```
 After curl is installed, install Rust with the following command:
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-Then, build the project:
+Then, clone this fork and build the server:
 ```shell
-cargo build --release -p phira-mp-server
+git clone https://github.com/HaixueNiyi/phira-mp
+cd phira-mp
+cargo build --release --locked -p phira-mp-server
 ```
 #### Running the Server
 You can run the application with the following command:
@@ -38,9 +40,9 @@ You can run the application with the following command:
 RUST_LOG=info target/release/phira-mp-server
 ```
 
-The port can also be specified via parameters:
+You can also specify the listen address and port (defaults to `[::]:12346` with fallback to `0.0.0.0:12346`):
 ```shell
-RUST_LOG=info target/release/phira-mp-server --port 8080
+RUST_LOG=info target/release/phira-mp-server --bind 0.0.0.0 --port 8080
 ```
 
 Log files are written to `./log/` (hourly rotation). Use `--log-level <off|error|warn|info|debug|trace>` (default `debug`) to choose what is written to the files, and `--log-max-files <N>` (default `168`, i.e. one week; `0` keeps everything) to limit how many rotated files are kept.
@@ -51,14 +53,14 @@ Log files are written to `./log/` (hourly rotation). Use `--log-level <off|error
 ```
 FROM ubuntu:22.04
 
-RUN apt-get update && apt-get -y upgrade && apt-get install -y curl git build-essential pkg-config openssl libssl-dev
+RUN apt-get update && apt-get -y upgrade && apt-get install -y ca-certificates curl git build-essential
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /root/
-RUN git clone https://github.com/TeamFlos/phira-mp
+RUN git clone https://github.com/HaixueNiyi/phira-mp
 WORKDIR /root/phira-mp
-RUN cargo build --release -p phira-mp-server
+RUN cargo build --release --locked -p phira-mp-server
 
 ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferred-port>"]
 ```

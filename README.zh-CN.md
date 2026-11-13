@@ -1,6 +1,6 @@
 # phira-mp
 
-`phira-mp` 是一个用 Rust 开发的项目。 以下是部署和运行该项目服务端的步骤。
+`phira-mp` 是一个用 Rust 开发的 Phira 多人游戏服务端与客户端库。本仓库基于 [TeamFlos/phira-mp](https://github.com/TeamFlos/phira-mp) 进行个人维护与安全/稳定性加固，保持与原版二进制通信协议兼容。
 
 简体中文 | [English Version](README.md)
 ## 环境
@@ -12,22 +12,24 @@
 #### 依赖
 首先，如果尚未安装 Rust，请安装。 您可以按照 https://www.rust-lang.org/tools/install 中的说明进行操作
 
-对于 Ubuntu 或 Debian 用户，如果尚未安装“curl”，请使用以下命令进行安装：
+对于 Ubuntu 或 Debian 用户，如果尚未安装 `curl` 与 `git`，请使用以下命令进行安装：
 
 ```shell
-sudo apt install curl
+sudo apt install curl git
 ```
 对于 Fedora 或 CentOS 用户，请使用以下命令：
 ```shell
-sudo yum install curl
+sudo yum install curl git
 ```
-安装curl后，使用以下命令安装Rust：
+安装 curl 后，使用以下命令安装 Rust：
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-然后，构建项目：
+然后克隆本仓库并构建服务端：
 ```shell
-cargo build --release -p phira-mp-server
+git clone https://github.com/HaixueNiyi/phira-mp
+cd phira-mp
+cargo build --release --locked -p phira-mp-server
 ```
 #### 运行服务端
 您可以使用以下命令运行该应用程序：
@@ -35,9 +37,9 @@ cargo build --release -p phira-mp-server
 RUST_LOG=info target/release/phira-mp-server
 ```
 
-也可以通过参数指定端口：
+也可以通过参数指定监听地址和端口（默认绑定 `[::]:12346`，失败时回退到 `0.0.0.0:12346`）：
 ```shell
-RUST_LOG=info target/release/phira-mp-server --port 8080
+RUST_LOG=info target/release/phira-mp-server --bind 0.0.0.0 --port 8080
 ```
 
 日志文件写入 `./log/`（按小时滚动）。可用 `--log-level <off|error|warn|info|debug|trace>`（默认 `debug`）控制写入文件的日志级别，用 `--log-max-files <N>`（默认 `168`，即一周；`0` 表示不清理）限制保留的日志文件数量。
@@ -48,14 +50,14 @@ RUST_LOG=info target/release/phira-mp-server --port 8080
 ```
 FROM ubuntu:22.04
 
-RUN apt-get update && apt-get -y upgrade && apt-get install -y curl git build-essential pkg-config openssl libssl-dev
+RUN apt-get update && apt-get -y upgrade && apt-get install -y ca-certificates curl git build-essential
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /root/
-RUN git clone https://github.com/TeamFlos/phira-mp
+RUN git clone https://github.com/HaixueNiyi/phira-mp
 WORKDIR /root/phira-mp
-RUN cargo build --release -p phira-mp-server
+RUN cargo build --release --locked -p phira-mp-server
 
 ENTRYPOINT ["/root/phira-mp/target/release/phira-mp-server", "--port", "<preferred-port>"]
 ```
