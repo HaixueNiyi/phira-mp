@@ -570,7 +570,12 @@ impl Session {
         )
         .await;
 
-        let room_state = match res.user.room.read().await.as_ref() {
+        let reconnected_room = res.user.room.read().await.as_ref().map(Arc::clone);
+        let cancel_wait = match &reconnected_room {
+            Some(room) => room.cancel_wait_for_ready_on_reconnect().await,
+            None => None,
+        };
+        let room_state = match &reconnected_room {
             Some(room) => Some(room.client_state(&res.user).await),
             None => None,
         };
@@ -578,6 +583,20 @@ impl Session {
             res.user.to_info(),
             room_state,
         ))));
+        if let (Some(room), Some((new_state, host_id))) = (reconnected_room, cancel_wait) {
+            for target in room.users().await.into_iter().chain(room.monitors().await) {
+                if target.id != res.user.id {
+                    if let Some(host_id) = host_id {
+                        target
+                            .try_send(ServerCommand::Message(Message::CancelGame {
+                                user: host_id,
+                            }))
+                            .await;
+                    }
+                    target.try_send(ServerCommand::ChangeState(new_state)).await;
+                }
+            }
+        }
         if done_tx.send(Some(Arc::downgrade(&res))).is_err() || res.stream.is_closed() {
             res.mark_lost();
         }

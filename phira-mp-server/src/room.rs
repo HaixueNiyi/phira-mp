@@ -378,6 +378,22 @@ impl Room {
         }
     }
 
+    /// Cancels `WaitForReady` back to `SelectChart` when a user reconnects so the reconnecting
+    /// client receives `RoomState::SelectChart(chart)` instead of `RoomState::WaitingForReady`
+    /// (which omits `chart_id` on the wire and causes upstream Phira 0.8.3 clients to panic
+    /// in `panel.rs:234` when tapping Ready).
+    pub async fn cancel_wait_for_ready_on_reconnect(&self) -> Option<(RoomState, Option<i32>)> {
+        let mut guard = self.state.write().await;
+        if matches!(*guard, InternalRoomState::WaitForReady { .. }) {
+            *guard = InternalRoomState::SelectChart;
+            let chart_id = self.chart.read().await.as_ref().map(|c| c.id);
+            let host_id = self.host.read().await.upgrade().map(|u| u.id);
+            Some((guard.to_client(chart_id), host_id))
+        } else {
+            None
+        }
+    }
+
     pub async fn check_all_ready(&self) {
         let mut guard = self.state.write().await;
         match guard.deref_mut() {
@@ -748,5 +764,35 @@ mod tests {
         assert!(!room.on_user_leave(&u2_new).await);
         assert!(!room.on_user_leave(&u2_new).await);
         assert!(u2_new.room.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_wait_for_ready_on_reconnect_returns_select_chart() {
+        let state = test_server_state();
+        let host = test_user(&state, 1);
+        let p2 = test_user(&state, 2);
+        let room = Arc::new(Room::new(room_id("wait-reconn"), Arc::downgrade(&host)));
+        assert_eq!(
+            room.add_user(Arc::downgrade(&p2), false).await,
+            AddUserResult::Added
+        );
+        *room.chart.write().await = Some(Chart {
+            id: 731,
+            name: "RENDA JOCEKY".to_owned(),
+        });
+        *room.state.write().await = InternalRoomState::WaitForReady {
+            started: HashSet::from([1]),
+        };
+
+        let cancelled = room.cancel_wait_for_ready_on_reconnect().await;
+        assert!(matches!(
+            cancelled,
+            Some((RoomState::SelectChart(Some(731)), Some(1)))
+        ));
+        assert!(matches!(
+            *room.state.read().await,
+            InternalRoomState::SelectChart
+        ));
+        assert!(room.cancel_wait_for_ready_on_reconnect().await.is_none());
     }
 }
