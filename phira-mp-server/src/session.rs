@@ -1,5 +1,5 @@
 use crate::{
-    AddUserResult, Chart, InternalRoomState, Record, Room, ServerState,
+    AddUserResult, Chart, InternalRoomState, ReconnectRoomAction, Record, Room, ServerState,
     l10n::{LANGUAGE, Language},
     tl,
 };
@@ -571,9 +571,23 @@ impl Session {
         .await;
 
         let reconnected_room = res.user.room.read().await.as_ref().map(Arc::clone);
-        let cancel_wait = match &reconnected_room {
-            Some(room) => room.cancel_wait_for_ready_on_reconnect().await,
-            None => None,
+        let (reconnected_room, cancel_wait) = match reconnected_room {
+            Some(room) => match room.prepare_reconnect().await {
+                ReconnectRoomAction::Keep => (Some(room), None),
+                ReconnectRoomAction::ResetWaitForReady { new_state, host_id } => {
+                    (Some(room), Some((new_state, host_id)))
+                }
+                ReconnectRoomAction::LeavePlaying => {
+                    if room.on_user_leave(&res.user).await {
+                        let mut rooms = server.rooms.write().await;
+                        if rooms.get(&room.id).is_some_and(|r| Arc::ptr_eq(r, &room)) {
+                            rooms.remove(&room.id);
+                        }
+                    }
+                    (None, None)
+                }
+            },
+            None => (None, None),
         };
         let room_state = match &reconnected_room {
             Some(room) => Some(room.client_state(&res.user).await),

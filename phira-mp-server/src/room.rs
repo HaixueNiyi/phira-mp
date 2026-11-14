@@ -48,6 +48,16 @@ pub enum AddUserResult {
     Dropped,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ReconnectRoomAction {
+    Keep,
+    ResetWaitForReady {
+        new_state: RoomState,
+        host_id: Option<i32>,
+    },
+    LeavePlaying,
+}
+
 pub struct Room {
     pub id: RoomId,
     pub host: RwLock<Weak<User>>,
@@ -378,19 +388,25 @@ impl Room {
         }
     }
 
-    /// Cancels `WaitForReady` back to `SelectChart` when a user reconnects so the reconnecting
-    /// client receives `RoomState::SelectChart(chart)` instead of `RoomState::WaitingForReady`
-    /// (which omits `chart_id` on the wire and causes upstream Phira 0.8.3 clients to panic
-    /// in `panel.rs:234` when tapping Ready).
-    pub async fn cancel_wait_for_ready_on_reconnect(&self) -> Option<(RoomState, Option<i32>)> {
+    /// Handles a user reconnecting while still attached to this room:
+    /// - `WaitForReady` is reset back to `SelectChart(chart)` so the reconnecting client
+    ///   receives `chart_id` on the wire (avoiding upstream Phira 0.8.3 `panel.rs:234` panic).
+    /// - `Playing` instructs the caller to detach the user from the room so restarted upstream
+    ///   clients do not receive `RoomState::Playing` with `chart_id = None` (`panel.rs:473` panic).
+    pub async fn prepare_reconnect(&self) -> ReconnectRoomAction {
         let mut guard = self.state.write().await;
-        if matches!(*guard, InternalRoomState::WaitForReady { .. }) {
-            *guard = InternalRoomState::SelectChart;
-            let chart_id = self.chart.read().await.as_ref().map(|c| c.id);
-            let host_id = self.host.read().await.upgrade().map(|u| u.id);
-            Some((guard.to_client(chart_id), host_id))
-        } else {
-            None
+        match *guard {
+            InternalRoomState::SelectChart => ReconnectRoomAction::Keep,
+            InternalRoomState::WaitForReady { .. } => {
+                *guard = InternalRoomState::SelectChart;
+                let chart_id = self.chart.read().await.as_ref().map(|c| c.id);
+                let host_id = self.host.read().await.upgrade().map(|u| u.id);
+                ReconnectRoomAction::ResetWaitForReady {
+                    new_state: guard.to_client(chart_id),
+                    host_id,
+                }
+            }
+            InternalRoomState::Playing { .. } => ReconnectRoomAction::LeavePlaying,
         }
     }
 
@@ -767,7 +783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_wait_for_ready_on_reconnect_returns_select_chart() {
+    async fn prepare_reconnect_handles_select_chart_wait_for_ready_and_playing() {
         let state = test_server_state();
         let host = test_user(&state, 1);
         let p2 = test_user(&state, 2);
@@ -780,19 +796,34 @@ mod tests {
             id: 731,
             name: "RENDA JOCEKY".to_owned(),
         });
+
+        assert!(matches!(
+            room.prepare_reconnect().await,
+            ReconnectRoomAction::Keep
+        ));
+
         *room.state.write().await = InternalRoomState::WaitForReady {
             started: HashSet::from([1]),
         };
-
-        let cancelled = room.cancel_wait_for_ready_on_reconnect().await;
         assert!(matches!(
-            cancelled,
-            Some((RoomState::SelectChart(Some(731)), Some(1)))
+            room.prepare_reconnect().await,
+            ReconnectRoomAction::ResetWaitForReady {
+                new_state: RoomState::SelectChart(Some(731)),
+                host_id: Some(1),
+            }
         ));
         assert!(matches!(
             *room.state.read().await,
             InternalRoomState::SelectChart
         ));
-        assert!(room.cancel_wait_for_ready_on_reconnect().await.is_none());
+
+        *room.state.write().await = InternalRoomState::Playing {
+            results: HashMap::new(),
+            aborted: HashSet::new(),
+        };
+        assert!(matches!(
+            room.prepare_reconnect().await,
+            ReconnectRoomAction::LeavePlaying
+        ));
     }
 }
