@@ -1,5 +1,6 @@
 use crate::{IdMap, Room, SafeMap, Session, User, vacant_id};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use phira_mp_common::RoomId;
 use serde::Deserialize;
 use std::{fs::File, io, path::Path, sync::Arc, time::Duration};
@@ -21,6 +22,7 @@ pub struct Chart {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub monitors: Vec<i32>,
 }
@@ -34,6 +36,7 @@ impl Default for ServerConfig {
 pub struct Record {
     pub id: i32,
     pub player: i32,
+    pub chart: i32,
     pub score: i32,
     pub perfect: i32,
     pub good: i32,
@@ -44,6 +47,7 @@ pub struct Record {
     pub full_combo: bool,
     pub std: f32,
     pub std_score: f32,
+    pub time: DateTime<Utc>,
 }
 
 pub struct ServerState {
@@ -92,6 +96,7 @@ impl Server {
         let http_client = reqwest::Client::builder()
             .timeout(AUTH_HTTP_TIMEOUT)
             .connect_timeout(AUTH_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client");
         let state = Arc::new(ServerState {
@@ -298,5 +303,11 @@ mod tests {
             res.is_err(),
             "malformed YAML must return Err instead of silently granting defaults"
         );
+
+        let partial = std::env::temp_dir().join(format!("phira_mp_partial_{}.yml", Uuid::new_v4()));
+        std::fs::write(&partial, "{}\n").unwrap();
+        let partial_cfg = load_server_config(&partial).unwrap();
+        let _ = std::fs::remove_file(&partial);
+        assert_eq!(partial_cfg.monitors, vec![2]);
     }
 }

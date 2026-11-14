@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::{net::TcpListener, sync::RwLock};
-use tracing::{metadata::LevelFilter, warn};
+use tracing::{info, metadata::LevelFilter, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use uuid::Uuid;
 
@@ -125,6 +125,28 @@ async fn bind_listener(bind: Option<IpAddr>, port: u16) -> Result<TcpListener> {
     }
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -136,12 +158,20 @@ async fn main() -> Result<()> {
 
     let server = Server::from_config(tcp_listener, config);
 
-    loop {
-        if let Err(err) = server.accept().await {
-            warn!("failed to accept: {err:?}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::select! {
+        _ = shutdown_signal() => {
+            info!("received shutdown signal, flushing logs and exiting");
         }
+        _ = async {
+            loop {
+                if let Err(err) = server.accept().await {
+                    warn!("failed to accept: {err:?}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        } => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]

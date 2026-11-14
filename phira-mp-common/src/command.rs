@@ -157,7 +157,7 @@ pub struct JudgeEvent {
     pub judgement: Judgement,
 }
 
-#[derive(Debug, BinaryData)]
+#[derive(BinaryData)]
 pub enum ClientCommand {
     Ping,
 
@@ -179,6 +179,36 @@ pub enum ClientCommand {
     CancelReady,
     Played { id: i32 },
     Abort,
+}
+
+impl std::fmt::Debug for ClientCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ping => f.write_str("Ping"),
+            Self::Authenticate { .. } => f
+                .debug_struct("Authenticate")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::Chat { message } => f.debug_struct("Chat").field("message", message).finish(),
+            Self::Touches { frames } => f.debug_struct("Touches").field("frames", frames).finish(),
+            Self::Judges { judges } => f.debug_struct("Judges").field("judges", judges).finish(),
+            Self::CreateRoom { id } => f.debug_struct("CreateRoom").field("id", id).finish(),
+            Self::JoinRoom { id, monitor } => f
+                .debug_struct("JoinRoom")
+                .field("id", id)
+                .field("monitor", monitor)
+                .finish(),
+            Self::LeaveRoom => f.write_str("LeaveRoom"),
+            Self::LockRoom { lock } => f.debug_struct("LockRoom").field("lock", lock).finish(),
+            Self::CycleRoom { cycle } => f.debug_struct("CycleRoom").field("cycle", cycle).finish(),
+            Self::SelectChart { id } => f.debug_struct("SelectChart").field("id", id).finish(),
+            Self::RequestStart => f.write_str("RequestStart"),
+            Self::Ready => f.write_str("Ready"),
+            Self::CancelReady => f.write_str("CancelReady"),
+            Self::Played { id } => f.debug_struct("Played").field("id", id).finish(),
+            Self::Abort => f.write_str("Abort"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, BinaryData)]

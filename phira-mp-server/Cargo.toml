@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 clap = { version = "4.5.58", features = ["derive"] }
 fluent = "0.17.0"
 fluent-syntax = "0.12.0"

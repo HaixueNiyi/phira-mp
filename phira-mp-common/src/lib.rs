@@ -10,7 +10,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -120,7 +120,7 @@ async fn write_packet<S: BinaryData + std::fmt::Debug>(
     ok
 }
 
-async fn read_packet_len(read: &mut OwnedReadHalf) -> Result<usize> {
+async fn read_packet_len(read: &mut OwnedReadHalf, max_len: &AtomicUsize) -> Result<usize> {
     let mut len = 0u32;
     let mut pos = 0u32;
     loop {
@@ -134,7 +134,7 @@ async fn read_packet_len(read: &mut OwnedReadHalf) -> Result<usize> {
         }
         pos += 7;
     }
-    if len as usize > MAX_PACKET_SIZE {
+    if len as usize > max_len.load(Ordering::Relaxed) {
         bail!("data packet too large");
     }
     Ok(len as usize)
@@ -146,6 +146,7 @@ pub struct Stream<S, R> {
     send_tx: Arc<mpsc::Sender<S>>,
     close_tx: watch::Sender<bool>,
     force_close: Arc<AtomicBool>,
+    max_recv_packet_size: Arc<AtomicUsize>,
 
     send_task_handle: JoinHandle<()>,
     recv_task_handle: JoinHandle<Result<()>>,
@@ -161,7 +162,19 @@ where
     pub async fn new<F>(
         version: Option<u8>,
         stream: TcpStream,
+        handler: Box<dyn FnMut(Arc<mpsc::Sender<S>>, R) -> F + Send + Sync>,
+    ) -> Result<Self>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self::new_with_limit(version, stream, handler, MAX_PACKET_SIZE).await
+    }
+
+    pub async fn new_with_limit<F>(
+        version: Option<u8>,
+        stream: TcpStream,
         mut handler: Box<dyn FnMut(Arc<mpsc::Sender<S>>, R) -> F + Send + Sync>,
+        max_recv_packet_size: usize,
     ) -> Result<Self>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -180,6 +193,8 @@ where
         let (close_tx, mut send_close_rx) = watch::channel(false);
         let mut recv_close_rx = close_tx.subscribe();
         let force_close = Arc::new(AtomicBool::new(false));
+        let max_recv_packet_size =
+            Arc::new(AtomicUsize::new(max_recv_packet_size.min(MAX_PACKET_SIZE)));
 
         let send_task_handle = tokio::spawn({
             let send_close_tx = close_tx.clone();
@@ -218,6 +233,7 @@ where
         let recv_task_handle = tokio::spawn({
             let send_tx = Arc::clone(&send_tx);
             let recv_close_tx = close_tx.clone();
+            let max_recv_packet_size = Arc::clone(&max_recv_packet_size);
             async move {
                 let _guard = CloseGuard(recv_close_tx);
                 let mut buffer = Vec::new();
@@ -229,7 +245,7 @@ where
                         biased;
                         _ = recv_close_rx.changed() => break,
                         res = async {
-                            let len = read_packet_len(&mut read).await?;
+                            let len = read_packet_len(&mut read, &max_recv_packet_size).await?;
                             buffer.clear();
                             if buffer.capacity() > IDLE_BUFFER_CAP && len <= IDLE_BUFFER_CAP {
                                 buffer.shrink_to(IDLE_BUFFER_CAP);
@@ -269,6 +285,7 @@ where
             send_tx,
             close_tx,
             force_close,
+            max_recv_packet_size,
 
             send_task_handle,
             recv_task_handle,
@@ -281,6 +298,11 @@ where
 impl<S, R> Stream<S, R> {
     pub fn version(&self) -> u8 {
         self.version
+    }
+
+    pub fn set_max_recv_packet_size(&self, limit: usize) {
+        self.max_recv_packet_size
+            .store(limit.min(MAX_PACKET_SIZE), Ordering::Relaxed);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -516,5 +538,77 @@ mod tests {
             hit_full,
             "expected try_send to fail once the send queue and socket buffer filled"
         );
+    }
+
+    #[test]
+    fn authenticate_debug_redacts_token() {
+        let secret = "super_secret_token_value_123456".to_owned();
+        let cmd = ClientCommand::Authenticate {
+            token: secret.clone().try_into().unwrap(),
+        };
+        let rendered = format!("{cmd:?}");
+        assert!(!rendered.contains(&secret));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn max_recv_packet_size_enforced_and_updatable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (rx_tx, mut rx_rx) = mpsc::channel(4);
+        let (limit_ready_tx, limit_ready_rx) = tokio::sync::oneshot::channel();
+        let (lower_ready_tx, lower_ready_rx) = tokio::sync::oneshot::channel();
+        let peer_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let peer: Stream<ServerCommand, ClientCommand> = Stream::new_with_limit(
+                None,
+                sock,
+                Box::new(move |_, cmd| {
+                    let rx_tx = rx_tx.clone();
+                    async move {
+                        let _ = rx_tx.send(cmd).await;
+                    }
+                }),
+                64,
+            )
+            .await
+            .unwrap();
+            let mut closed = peer.closed();
+            peer.set_max_recv_packet_size(128);
+            let _ = limit_ready_tx.send(());
+            let _ = rx_rx.recv().await;
+            peer.set_max_recv_packet_size(32);
+            let _ = lower_ready_tx.send(());
+            let res = time::timeout(Duration::from_secs(1), closed.changed()).await;
+            (res.is_ok(), peer.is_closed())
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let client: Stream<ClientCommand, ServerCommand> =
+            Stream::new(Some(1), sock, Box::new(|_, _| async {}))
+                .await
+                .unwrap();
+
+        limit_ready_rx.await.unwrap();
+        // Within 128-byte limit (and larger than initial 64-byte limit): succeeds.
+        client
+            .send(ClientCommand::Chat {
+                message: "a".repeat(80).try_into().unwrap(),
+            })
+            .await
+            .unwrap();
+
+        lower_ready_rx.await.unwrap();
+        // Exceeds lowered 32-byte limit: receiver drops packet and closes stream.
+        client
+            .send(ClientCommand::Chat {
+                message: "a".repeat(80).try_into().unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let (changed, closed) = peer_task.await.unwrap();
+        assert!(changed);
+        assert!(closed);
     }
 }

@@ -4,6 +4,8 @@ use crate::{
     tl,
 };
 use anyhow::{Result, anyhow, bail};
+#[cfg(test)]
+use chrono::Utc;
 use phira_mp_common::{
     ClientCommand, HEARTBEAT_DISCONNECT_TIMEOUT, JoinRoomResponse, JudgeEvent, MAX_PACKET_SIZE,
     Message, ServerCommand, Stream, TouchFrame, UserInfo,
@@ -16,7 +18,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,6 +32,11 @@ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use uuid::Uuid;
 
 const HOST: &str = "https://phira.5wyxi.com";
+const UNAUTH_MAX_PACKET_SIZE: usize = 1024;
+const AUTH_MAX_PACKET_SIZE: usize = 64 * 1024;
+const LIVE_BYTE_CAPACITY: f64 = 512.0 * 1024.0;
+const LIVE_BYTE_REFILL_PER_SEC: f64 = 256.0 * 1024.0;
+const RECORD_TIME_SKEW_TOLERANCE: chrono::TimeDelta = chrono::TimeDelta::seconds(5);
 
 struct TokenBucket {
     tokens: f64,
@@ -45,14 +52,18 @@ impl TokenBucket {
     }
 
     fn take(&mut self, capacity: f64, refill_per_sec: f64) -> bool {
+        self.take_amount(1.0, capacity, refill_per_sec)
+    }
+
+    fn take_amount(&mut self, cost: f64, capacity: f64, refill_per_sec: f64) -> bool {
         let now = Instant::now();
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
         self.last_refill = now;
         self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -62,49 +73,64 @@ impl TokenBucket {
 
 pub struct User {
     pub id: i32,
-    pub name: String,
-    pub lang: Language,
+    name: std::sync::RwLock<String>,
+    lang: std::sync::RwLock<Language>,
 
     pub server: Arc<ServerState>,
     pub session: RwLock<Option<Weak<Session>>>,
+    latest_session_id: std::sync::RwLock<Option<Uuid>>,
     pub room: RwLock<Option<Arc<Room>>>,
 
     pub monitor: AtomicBool,
-    pub game_time: AtomicU32,
 
     pub dangle_mark: Mutex<Option<Arc<()>>>,
 
     chat_limit: std::sync::Mutex<TokenBucket>,
     room_op_limit: std::sync::Mutex<TokenBucket>,
     live_frame_limit: std::sync::Mutex<TokenBucket>,
+    live_byte_limit: std::sync::Mutex<TokenBucket>,
 }
 
 impl User {
     pub fn new(id: i32, name: String, lang: Language, server: Arc<ServerState>) -> Self {
         Self {
             id,
-            name,
-            lang,
+            name: std::sync::RwLock::new(name),
+            lang: std::sync::RwLock::new(lang),
 
             server,
             session: RwLock::default(),
+            latest_session_id: std::sync::RwLock::new(None),
             room: RwLock::default(),
 
             monitor: AtomicBool::default(),
-            game_time: AtomicU32::default(),
 
             dangle_mark: Mutex::default(),
 
             chat_limit: std::sync::Mutex::new(TokenBucket::new(10.0)),
             room_op_limit: std::sync::Mutex::new(TokenBucket::new(15.0)),
             live_frame_limit: std::sync::Mutex::new(TokenBucket::new(300.0)),
+            live_byte_limit: std::sync::Mutex::new(TokenBucket::new(LIVE_BYTE_CAPACITY)),
         }
+    }
+
+    pub fn name(&self) -> String {
+        self.name.read().unwrap().clone()
+    }
+
+    pub fn lang(&self) -> Language {
+        self.lang.read().unwrap().clone()
+    }
+
+    pub fn update_profile(&self, name: String, lang: Language) {
+        *self.name.write().unwrap() = name;
+        *self.lang.write().unwrap() = lang;
     }
 
     pub fn to_info(&self) -> UserInfo {
         UserInfo {
             id: self.id,
-            name: self.name.clone(),
+            name: self.name(),
             monitor: self.monitor.load(Ordering::SeqCst),
         }
     }
@@ -113,9 +139,14 @@ impl User {
         self.server.config.monitors.contains(&self.id)
     }
 
-    pub async fn set_session(&self, session: Weak<Session>) -> Option<Weak<Session>> {
+    pub async fn set_session(
+        &self,
+        session_id: Uuid,
+        session: Weak<Session>,
+    ) -> Option<Weak<Session>> {
         let mut mark = self.dangle_mark.lock().await;
         *mark = None;
+        *self.latest_session_id.write().unwrap() = Some(session_id);
         self.session.write().await.replace(session)
     }
 
@@ -149,7 +180,10 @@ impl User {
         if let Some(room) = room {
             let is_playing_unfinished = {
                 let guard = room.state.read().await;
-                if let InternalRoomState::Playing { results, aborted } = &*guard {
+                if let InternalRoomState::Playing {
+                    results, aborted, ..
+                } = &*guard
+                {
                     !self.monitor.load(Ordering::SeqCst)
                         && !results.contains_key(&self.id)
                         && !aborted.contains(&self.id)
@@ -164,15 +198,13 @@ impl User {
                     let mut mark_guard = self.dangle_mark.lock().await;
                     let mut session_guard = self.session.write().await;
                     let matches_session = match expected_session {
-                        Some(sid) => session_guard
-                            .as_ref()
-                            .and_then(Weak::upgrade)
-                            .is_none_or(|s| s.id == sid),
+                        Some(sid) => *self.latest_session_id.read().unwrap() == Some(sid),
                         None => true,
                     };
                     if matches_session {
                         *mark_guard = None;
                         *session_guard = None;
+                        *self.latest_session_id.write().unwrap() = None;
                         if users_guard
                             .get(&self.id)
                             .is_some_and(|u| Arc::ptr_eq(u, &self))
@@ -196,12 +228,9 @@ impl User {
         let dangle_mark = Arc::new(());
         {
             let mut mark_guard = self.dangle_mark.lock().await;
-            let session_guard = self.session.read().await;
+            let _session_guard = self.session.read().await;
             let matches_session = match expected_session {
-                Some(sid) => session_guard
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                    .is_none_or(|s| s.id == sid),
+                Some(sid) => *self.latest_session_id.read().unwrap() == Some(sid),
                 None => true,
             };
             if !matches_session {
@@ -222,6 +251,7 @@ impl User {
                 } else {
                     *mark_guard = None;
                     *self.session.write().await = None;
+                    *self.latest_session_id.write().unwrap() = None;
                     if users_guard
                         .get(&self.id)
                         .is_some_and(|u| Arc::ptr_eq(u, &self))
@@ -405,7 +435,7 @@ fn build_stream_handler(
             let user = Arc::clone(&session.user);
             drop(session);
             if let Some(resp) = LANGUAGE
-                .scope(Arc::new(user.lang.clone()), process(user, cmd))
+                .scope(Arc::new(user.lang()), process(user, cmd))
                 .await
                 && let Err(err) = send_tx.try_send(resp)
             {
@@ -423,7 +453,8 @@ fn build_stream_handler(
 }
 
 impl Session {
-    async fn install(
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_locked(
         id: Uuid,
         stream: Stream<ServerCommand, ClientCommand>,
         user: Arc<User>,
@@ -431,7 +462,7 @@ impl Session {
         panicked: Arc<AtomicBool>,
         this: &Arc<OnceCell<Weak<Session>>>,
         heartbeat_timeout: Duration,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, Option<Weak<Session>>) {
         let server = Arc::clone(&user.server);
         let stream_close_rx = stream.closed();
         let res = Arc::new_cyclic(|weak_self| {
@@ -453,12 +484,36 @@ impl Session {
             }
         });
         let _ = this.set(Arc::downgrade(&res));
-        let old_session = res.user.set_session(Arc::downgrade(&res)).await;
+        let old_session = res.user.set_session(id, Arc::downgrade(&res)).await;
         server
             .sessions
             .write()
             .await
             .insert(res.id, Arc::clone(&res));
+        (res, old_session)
+    }
+
+    #[cfg(test)]
+    async fn install(
+        id: Uuid,
+        stream: Stream<ServerCommand, ClientCommand>,
+        user: Arc<User>,
+        last_recv: Arc<std::sync::Mutex<Instant>>,
+        panicked: Arc<AtomicBool>,
+        this: &Arc<OnceCell<Weak<Session>>>,
+        heartbeat_timeout: Duration,
+    ) -> Arc<Self> {
+        let server = Arc::clone(&user.server);
+        let (res, old_session) = Self::attach_locked(
+            id,
+            stream,
+            user,
+            last_recv,
+            panicked,
+            this,
+            heartbeat_timeout,
+        )
+        .await;
         if let Some(old) = old_session.and_then(|w| w.upgrade())
             && !Arc::ptr_eq(&old, &res)
         {
@@ -489,7 +544,12 @@ impl Session {
         );
         let mut stream = time::timeout(
             HEARTBEAT_DISCONNECT_TIMEOUT,
-            Stream::<ServerCommand, ClientCommand>::new(None, stream, handler),
+            Stream::<ServerCommand, ClientCommand>::new_with_limit(
+                None,
+                stream,
+                handler,
+                UNAUTH_MAX_PACKET_SIZE,
+            ),
         )
         .await
         .map_err(|_| anyhow!("handshake timed out"))??;
@@ -538,37 +598,46 @@ impl Session {
             }
         };
 
-        let user = {
+        let lang = resp.language.parse().map(Language).unwrap_or_default();
+        // Hold `server.users` write lock until `attach_locked` updates `user.session` and
+        // `latest_session_id` so an in-flight `dangle_with_delay` from an older session
+        // cannot slip in and evict the newly authenticated user.
+        let (res, old_session) = {
             let mut users_guard = server.users.write().await;
-            match users_guard.entry(resp.id) {
+            let user = match users_guard.entry(resp.id) {
                 Entry::Occupied(e) => {
                     let u = Arc::clone(e.get());
+                    u.update_profile(resp.name, lang);
                     *u.dangle_mark.lock().await = None;
                     u
                 }
                 Entry::Vacant(e) => {
-                    let u = Arc::new(User::new(
-                        resp.id,
-                        resp.name,
-                        resp.language.parse().map(Language).unwrap_or_default(),
-                        Arc::clone(&server),
-                    ));
+                    let u = Arc::new(User::new(resp.id, resp.name, lang, Arc::clone(&server)));
                     e.insert(Arc::clone(&u));
                     u
                 }
-            }
+            };
+            Self::attach_locked(
+                id,
+                stream,
+                user,
+                last_recv,
+                panicked,
+                &this,
+                HEARTBEAT_DISCONNECT_TIMEOUT,
+            )
+            .await
         };
-
-        let res = Self::install(
-            id,
-            stream,
-            user,
-            last_recv,
-            panicked,
-            &this,
-            HEARTBEAT_DISCONNECT_TIMEOUT,
-        )
-        .await;
+        if let Some(old) = old_session.and_then(|w| w.upgrade())
+            && !Arc::ptr_eq(&old, &res)
+        {
+            info!(
+                "kicking previous session {} for user {}",
+                old.id, res.user.id
+            );
+            old.close_replaced(&server).await;
+        }
+        res.stream.set_max_recv_packet_size(AUTH_MAX_PACKET_SIZE);
 
         let reconnected_room = res.user.room.read().await.as_ref().map(Arc::clone);
         let (reconnected_room, cancel_wait) = match reconnected_room {
@@ -621,8 +690,8 @@ impl Session {
         self.stream.version()
     }
 
-    pub fn name(&self) -> &str {
-        &self.user.name
+    pub fn name(&self) -> String {
+        self.user.name()
     }
 
     pub fn mark_lost(&self) {
@@ -693,9 +762,21 @@ async fn apply_played_record(user: &User, room: &Room, res: Record) -> Result<()
     }
     let (score, accuracy, full_combo) = {
         let mut guard = room.state.write().await;
-        let InternalRoomState::Playing { results, aborted } = guard.deref_mut() else {
+        let InternalRoomState::Playing {
+            chart_id,
+            started_at,
+            results,
+            aborted,
+        } = guard.deref_mut()
+        else {
             bail!("invalid state");
         };
+        if res.chart != *chart_id {
+            bail!("invalid record");
+        }
+        if res.time < *started_at - RECORD_TIME_SKEW_TOLERANCE {
+            bail!("invalid record");
+        }
         if !room.contains_user(user.id).await {
             bail!("no room");
         }
@@ -780,21 +861,25 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 warn!("monitor {} attempted to send touch events", user.id);
                 return None;
             }
-            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0) {
-                warn!("rate limiting touch events from {}", user.id);
+            let est_bytes = estimate_touches_bytes(&frames);
+            if est_bytes > MAX_PACKET_SIZE - 16 {
+                warn!("dropping oversized touch frame batch from {}", user.id);
                 return None;
             }
-            if estimate_touches_bytes(&frames) > MAX_PACKET_SIZE - 16 {
-                warn!("dropping oversized touch frame batch from {}", user.id);
+            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0)
+                || !user.live_byte_limit.lock().unwrap().take_amount(
+                    est_bytes as f64,
+                    LIVE_BYTE_CAPACITY,
+                    LIVE_BYTE_REFILL_PER_SEC,
+                )
+            {
+                warn!("rate limiting touch events from {}", user.id);
                 return None;
             }
             if room.is_live()
                 && matches!(*room.state.read().await, InternalRoomState::Playing { .. })
             {
                 debug!("received {} touch events from {}", frames.len(), user.id);
-                if let Some(frame) = frames.last() {
-                    user.game_time.store(frame.time.to_bits(), Ordering::SeqCst);
-                }
                 room.queue_monitor(ServerCommand::Touches {
                     player: user.id,
                     frames,
@@ -810,12 +895,19 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 warn!("monitor {} attempted to send judge events", user.id);
                 return None;
             }
-            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0) {
-                warn!("rate limiting judge events from {}", user.id);
+            let est_bytes = estimate_judges_bytes(&judges);
+            if est_bytes > MAX_PACKET_SIZE - 16 {
+                warn!("dropping oversized judge batch from {}", user.id);
                 return None;
             }
-            if estimate_judges_bytes(&judges) > MAX_PACKET_SIZE - 16 {
-                warn!("dropping oversized judge batch from {}", user.id);
+            if !user.live_frame_limit.lock().unwrap().take(300.0, 200.0)
+                || !user.live_byte_limit.lock().unwrap().take_amount(
+                    est_bytes as f64,
+                    LIVE_BYTE_CAPACITY,
+                    LIVE_BYTE_REFILL_PER_SEC,
+                )
+            {
+                warn!("rate limiting judge events from {}", user.id);
                 return None;
             }
             if room.is_live()
@@ -935,7 +1027,7 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     .await;
                 room.send(Message::JoinRoom {
                     user: user.id,
-                    name: user.name.clone(),
+                    name: user.name(),
                 })
                 .await;
                 Ok(())
@@ -1022,10 +1114,22 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                         .http_client
                         .get(format!("{HOST}/chart/{id}"))
                         .send()
-                        .await?
-                        .error_for_status()?
+                        .await
+                        .map_err(|err| {
+                            warn!("failed to fetch chart {id}: {err:?}");
+                            anyhow!("failed to fetch chart")
+                        })?
+                        .error_for_status()
+                        .map_err(|err| {
+                            warn!("failed to fetch chart {id}: {err:?}");
+                            anyhow!("failed to fetch chart")
+                        })?
                         .json()
-                        .await?;
+                        .await
+                        .map_err(|err| {
+                            warn!("failed to parse chart {id}: {err:?}");
+                            anyhow!("failed to fetch chart")
+                        })?;
                     debug!("chart is {res:?}");
                     let (chart_name, chart_id, room_state) = {
                         let state_guard = room.state.write().await;
@@ -1080,7 +1184,6 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     };
                     state_guard.to_client(Some(chart_id))
                 };
-                room.reset_game_time().await;
                 room.send(Message::GameStart { user: user.id }).await;
                 room.broadcast(ServerCommand::ChangeState(client_state))
                     .await;
@@ -1160,7 +1263,10 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 }
                 {
                     let guard = room.state.read().await;
-                    let InternalRoomState::Playing { results, aborted } = &*guard else {
+                    let InternalRoomState::Playing {
+                        results, aborted, ..
+                    } = &*guard
+                    else {
                         bail!("invalid state");
                     };
                     if aborted.contains(&user.id) {
@@ -1175,10 +1281,22 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     .http_client
                     .get(format!("{HOST}/record/{id}"))
                     .send()
-                    .await?
-                    .error_for_status()?
+                    .await
+                    .map_err(|err| {
+                        warn!("failed to fetch record {id}: {err:?}");
+                        anyhow!("failed to fetch record")
+                    })?
+                    .error_for_status()
+                    .map_err(|err| {
+                        warn!("failed to fetch record {id}: {err:?}");
+                        anyhow!("failed to fetch record")
+                    })?
                     .json()
-                    .await?;
+                    .await
+                    .map_err(|err| {
+                        warn!("failed to parse record {id}: {err:?}");
+                        anyhow!("failed to fetch record")
+                    })?;
                 if res.id != id {
                     bail!("invalid record");
                 }
@@ -1196,7 +1314,10 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 }
                 {
                     let mut guard = room.state.write().await;
-                    let InternalRoomState::Playing { results, aborted } = guard.deref_mut() else {
+                    let InternalRoomState::Playing {
+                        results, aborted, ..
+                    } = guard.deref_mut()
+                    else {
                         bail!("invalid state");
                     };
                     if results.contains_key(&user.id) {
@@ -1331,7 +1452,7 @@ mod tests {
             panicked: Arc::new(AtomicBool::new(false)),
             monitor_task_handle: tokio::spawn(async {}),
         });
-        user.set_session(Arc::downgrade(&session)).await;
+        user.set_session(id, Arc::downgrade(&session)).await;
 
         let big = "x".repeat(60_000);
         for _ in 0..2_000 {
@@ -1520,6 +1641,8 @@ mod tests {
 
         // Also test Playing branch: stale disconnect for s1_id after s2 reconnected must not abort.
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: std::collections::HashMap::new(),
             aborted: HashSet::new(),
         };
@@ -1828,6 +1951,8 @@ mod tests {
 
         // Enter Playing.
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: std::collections::HashMap::new(),
             aborted: HashSet::new(),
         };
@@ -1858,6 +1983,16 @@ mod tests {
                 .is_err()
         );
 
+        // Wrong chart ID must be rejected.
+        let mut wrong_chart = make_rec(5030, 1);
+        wrong_chart.chart = 999;
+        assert!(apply_played_record(&p1, &room, wrong_chart).await.is_err());
+
+        // Record created well before the round started must be rejected.
+        let mut stale_rec = make_rec(5031, 1);
+        stale_rec.time = Utc::now() - chrono::TimeDelta::seconds(60);
+        assert!(apply_played_record(&p1, &room, stale_rec).await.is_err());
+
         // Valid upload finishes round 1 -> transitions to SelectChart.
         assert!(
             apply_played_record(&p1, &room, make_rec(505, 1))
@@ -1871,6 +2006,8 @@ mod tests {
 
         // Re-using the exact same record ID 505 in round 2 must be rejected.
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: std::collections::HashMap::new(),
             aborted: HashSet::new(),
         };
@@ -1928,6 +2065,8 @@ mod tests {
 
         // Enter Playing.
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: std::collections::HashMap::new(),
             aborted: HashSet::new(),
         };
@@ -1971,6 +2110,7 @@ mod tests {
         Record {
             id: rec_id,
             player,
+            chart: 1,
             score: 900_000,
             perfect: 100,
             good: 0,
@@ -1981,6 +2121,7 @@ mod tests {
             full_combo: true,
             std: 0.0,
             std_score: 0.0,
+            time: Utc::now(),
         }
     }
 
@@ -2090,6 +2231,8 @@ mod tests {
         let mut results = std::collections::HashMap::new();
         results.insert(21, make_rec(701, 21));
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results,
             aborted: HashSet::new(),
         };
@@ -2107,5 +2250,56 @@ mod tests {
             .await;
         assert!(!state.users.read().await.contains_key(&22));
         assert!(!room.contains_user(22).await);
+    }
+
+    #[tokio::test]
+    async fn stale_dangle_with_dropped_new_session_does_not_evict_user() {
+        let (state, _lost_rx) = dummy_state();
+        let user = Arc::new(User::new(
+            31,
+            "old-name".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        state.users.write().await.insert(31, Arc::clone(&user));
+
+        let (s1_srv, mut s1_cli) = loopback_pair().await;
+        s1_cli.write_all(&[1]).await.unwrap();
+        let s1_id = Uuid::new_v4();
+        let _s1 =
+            Session::connect_test_user(s1_id, s1_srv, Arc::clone(&user), Duration::from_secs(60))
+                .await;
+
+        let (s2_srv, mut s2_cli) = loopback_pair().await;
+        s2_cli.write_all(&[1]).await.unwrap();
+        let s2_id = Uuid::new_v4();
+        let s2 =
+            Session::connect_test_user(s2_id, s2_srv, Arc::clone(&user), Duration::from_secs(60))
+                .await;
+        // Remove s2 so `user.session` Weak reference cannot upgrade anymore, while
+        // `latest_session_id` still records s2_id.
+        state.sessions.write().await.remove(&s2_id);
+        drop(s2);
+
+        user.update_profile("new-name".to_owned(), Language("zh-CN".parse().unwrap()));
+        assert_eq!(user.name(), "new-name");
+        assert_eq!(user.lang().0.to_string(), "zh-CN");
+
+        Arc::clone(&user)
+            .dangle_with_delay(Some(s1_id), Duration::from_millis(40))
+            .await;
+        time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            state.users.read().await.contains_key(&31),
+            "stale dangle for s1_id must not evict user replaced by s2_id"
+        );
+    }
+
+    #[test]
+    fn token_bucket_enforces_byte_cost() {
+        let mut bucket = TokenBucket::new(1024.0);
+        assert!(bucket.take_amount(600.0, 1024.0, 100.0));
+        assert!(!bucket.take_amount(600.0, 1024.0, 100.0));
+        assert!(bucket.take_amount(400.0, 1024.0, 100.0));
     }
 }

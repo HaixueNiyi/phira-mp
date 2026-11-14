@@ -1,5 +1,6 @@
 use crate::{Chart, Record, User};
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
 use phira_mp_common::{ClientRoomState, Message, RoomId, RoomState, ServerCommand};
 use rand::seq::IndexedRandom;
 use std::{
@@ -7,8 +8,9 @@ use std::{
     ops::DerefMut,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{Mutex, RwLock, mpsc},
@@ -17,6 +19,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 const ROOM_MAX_USERS: usize = 8;
+const MONITOR_DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default, Debug)]
 pub enum InternalRoomState {
@@ -26,6 +29,8 @@ pub enum InternalRoomState {
         started: HashSet<i32>,
     },
     Playing {
+        chart_id: i32,
+        started_at: DateTime<Utc>,
         results: HashMap<i32, Record>,
         aborted: HashSet<i32>,
     },
@@ -74,6 +79,8 @@ pub struct Room {
     monitors: Arc<RwLock<Vec<Weak<User>>>>,
     monitor_tx: mpsc::Sender<ServerCommand>,
     monitor_task_handle: JoinHandle<()>,
+    monitor_dropped_count: AtomicU64,
+    monitor_drop_last_warn: std::sync::Mutex<Option<Instant>>,
     pub chart: RwLock<Option<Chart>>,
     game_user_names: RwLock<HashMap<i32, String>>,
     game_host: RwLock<Option<(i32, String)>>,
@@ -135,6 +142,8 @@ impl Room {
             monitors,
             monitor_tx,
             monitor_task_handle,
+            monitor_dropped_count: AtomicU64::new(0),
+            monitor_drop_last_warn: std::sync::Mutex::new(None),
             chart: RwLock::default(),
             game_user_names: RwLock::default(),
             game_host: RwLock::default(),
@@ -263,10 +272,28 @@ impl Room {
 
     pub fn queue_monitor(&self, cmd: ServerCommand) {
         if let Err(err) = self.monitor_tx.try_send(cmd) {
-            warn!(
-                room = self.id.to_string(),
-                "dropping live monitor packet: {err:?}"
-            );
+            let total_dropped = self.monitor_dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = Instant::now();
+            let should_warn = {
+                let mut last_warn = self.monitor_drop_last_warn.lock().unwrap();
+                match *last_warn {
+                    Some(prev)
+                        if now.saturating_duration_since(prev) < MONITOR_DROP_WARN_INTERVAL =>
+                    {
+                        false
+                    }
+                    _ => {
+                        *last_warn = Some(now);
+                        true
+                    }
+                }
+            };
+            if should_warn {
+                warn!(
+                    room = self.id.to_string(),
+                    total_dropped, "dropping live monitor packet: {err:?}"
+                );
+            }
         }
     }
 
@@ -304,7 +331,9 @@ impl Room {
             user.monitor.store(false, Ordering::SeqCst);
         } else {
             let mut guard = self.state.write().await;
-            if let InternalRoomState::Playing { results, aborted } = guard.deref_mut()
+            if let InternalRoomState::Playing {
+                results, aborted, ..
+            } = guard.deref_mut()
                 && !results.contains_key(&user.id)
             {
                 aborted.insert(user.id);
@@ -321,7 +350,7 @@ impl Room {
         }
         self.send(Message::LeaveRoom {
             user: user.id,
-            name: user.name.clone(),
+            name: user.name(),
         })
         .await;
 
@@ -361,7 +390,7 @@ impl Room {
                     monitor
                         .try_send(ServerCommand::Message(Message::LeaveRoom {
                             user: monitor.id,
-                            name: monitor.name.clone(),
+                            name: monitor.name(),
                         }))
                         .await;
                 }
@@ -379,13 +408,6 @@ impl Room {
         }
         self.check_all_ready().await;
         false
-    }
-
-    pub async fn reset_game_time(&self) {
-        for user in self.users().await {
-            user.game_time
-                .store(f32::NEG_INFINITY.to_bits(), Ordering::SeqCst);
-        }
     }
 
     /// Handles a user reconnecting while still attached to this room:
@@ -421,35 +443,40 @@ impl Room {
                         .chain(self.monitors().await)
                         .all(|it| started.contains(&it.id))
                 {
+                    let chart_id = self
+                        .chart
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|c| c.id)
+                        .unwrap_or_default();
                     *guard = InternalRoomState::Playing {
+                        chart_id,
+                        started_at: Utc::now(),
                         results: HashMap::new(),
                         aborted: HashSet::new(),
                     };
                     drop(guard);
                     info!(room = self.id.to_string(), "game start");
                     let users = self.users().await;
-                    let host_snapshot = self
-                        .host
-                        .read()
-                        .await
-                        .upgrade()
-                        .map(|u| (u.id, u.name.clone()));
+                    let host_snapshot = self.host.read().await.upgrade().map(|u| (u.id, u.name()));
                     {
                         let mut names = self.game_user_names.write().await;
                         names.clear();
                         for user in &users {
-                            names.insert(user.id, user.name.clone());
+                            names.insert(user.id, user.name());
                         }
                     }
                     *self.game_host.write().await = host_snapshot;
                     self.send(Message::StartPlaying).await;
-                    self.reset_game_time().await;
                     self.on_state_change().await;
                 }
             }
             // clippy suggests folding the `if` into a match guard, but a guard cannot `.await`.
             #[allow(clippy::collapsible_match)]
-            InternalRoomState::Playing { results, aborted } => {
+            InternalRoomState::Playing {
+                results, aborted, ..
+            } => {
                 let users = self.users().await;
                 if users
                     .iter()
@@ -592,6 +619,7 @@ mod tests {
         Record {
             id: player,
             player,
+            chart: 1,
             score: 1,
             perfect: 1,
             good: 0,
@@ -602,6 +630,7 @@ mod tests {
             full_combo: true,
             std: 0.0,
             std_score: 0.0,
+            time: Utc::now(),
         }
     }
 
@@ -632,6 +661,8 @@ mod tests {
             );
             room.cycle.store(true, Ordering::SeqCst);
             *room.state.write().await = InternalRoomState::Playing {
+                chart_id: 1,
+                started_at: Utc::now(),
                 results: [1, 2, 3]
                     .into_iter()
                     .map(|id| (id, test_record(id)))
@@ -742,6 +773,8 @@ mod tests {
         // Even if state is Playing with empty users and cycle=true, check_all_ready must not panic.
         assert!(room.on_user_leave(&host).await);
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: HashMap::new(),
             aborted: HashSet::new(),
         };
@@ -818,6 +851,8 @@ mod tests {
         ));
 
         *room.state.write().await = InternalRoomState::Playing {
+            chart_id: 1,
+            started_at: Utc::now(),
             results: HashMap::new(),
             aborted: HashSet::new(),
         };
