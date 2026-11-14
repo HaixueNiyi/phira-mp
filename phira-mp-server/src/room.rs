@@ -65,6 +65,8 @@ pub struct Room {
     monitor_tx: mpsc::Sender<ServerCommand>,
     monitor_task_handle: JoinHandle<()>,
     pub chart: RwLock<Option<Chart>>,
+    game_user_names: RwLock<HashMap<i32, String>>,
+    game_host: RwLock<Option<(i32, String)>>,
 }
 
 fn remove_user_ptr(list: &mut Vec<Weak<User>>, user: &User) -> bool {
@@ -124,6 +126,8 @@ impl Room {
             monitor_tx,
             monitor_task_handle,
             chart: RwLock::default(),
+            game_user_names: RwLock::default(),
+            game_host: RwLock::default(),
         }
     }
 
@@ -288,6 +292,13 @@ impl Room {
 
         if removed_monitor {
             user.monitor.store(false, Ordering::SeqCst);
+        } else {
+            let mut guard = self.state.write().await;
+            if let InternalRoomState::Playing { results, aborted } = guard.deref_mut()
+                && !results.contains_key(&user.id)
+            {
+                aborted.insert(user.id);
+            }
         }
         {
             let mut room_guard = user.room.write().await;
@@ -384,6 +395,21 @@ impl Room {
                     };
                     drop(guard);
                     info!(room = self.id.to_string(), "game start");
+                    let users = self.users().await;
+                    let host_snapshot = self
+                        .host
+                        .read()
+                        .await
+                        .upgrade()
+                        .map(|u| (u.id, u.name.clone()));
+                    {
+                        let mut names = self.game_user_names.write().await;
+                        names.clear();
+                        for user in &users {
+                            names.insert(user.id, user.name.clone());
+                        }
+                    }
+                    *self.game_host.write().await = host_snapshot;
                     self.send(Message::StartPlaying).await;
                     self.reset_game_time().await;
                     self.on_state_change().await;
@@ -397,9 +423,75 @@ impl Room {
                     .iter()
                     .all(|it| results.contains_key(&it.id) || aborted.contains(&it.id))
                 {
+                    let current_host = self.host.read().await.upgrade();
+                    let sender = current_host.or_else(|| users.first().cloned());
+                    let content = if let Some(sender) = sender.as_ref() {
+                        let names = self.game_user_names.read().await;
+                        let start_host = self.game_host.read().await.clone();
+                        let mut ranking: Vec<_> = results
+                            .iter()
+                            .filter(|(id, _)| !aborted.contains(id))
+                            .collect();
+
+                        ranking.sort_by(|a, b| {
+                            b.1.accuracy
+                                .total_cmp(&a.1.accuracy)
+                                .then_with(|| a.1.std.total_cmp(&b.1.std))
+                                .then_with(|| b.1.score.cmp(&a.1.score))
+                        });
+
+                        let mut content = match start_host {
+                            Some((id, orig_name)) if id != sender.id => {
+                                format!("本局房主（开局：{orig_name}）\n本局排名：")
+                            }
+                            _ => String::from("本局房主\n本局排名："),
+                        };
+
+                        if ranking.is_empty() {
+                            content.push_str("\n本局无人完成游玩");
+                        } else {
+                            for (index, (id, record)) in ranking.iter().enumerate() {
+                                let name = names.get(id).map(String::as_str).unwrap_or("未知玩家");
+
+                                content.push_str(&format!(
+                                    "\n{}. {}  {:07}  ({:.2}%) {:.0}ms{}",
+                                    index + 1,
+                                    name,
+                                    record.score,
+                                    record.accuracy * 100.0,
+                                    record.std * 1000.0,
+                                    if record.full_combo { " FC" } else { "" },
+                                ));
+                            }
+                        }
+
+                        if !aborted.is_empty() {
+                            let mut aborted_names: Vec<_> = aborted
+                                .iter()
+                                .filter_map(|id| names.get(id))
+                                .cloned()
+                                .collect();
+
+                            aborted_names.sort();
+
+                            content.push_str("\n\n放弃：");
+
+                            for name in aborted_names {
+                                content.push_str(&format!("\n{}", name));
+                            }
+                        }
+
+                        Some(content)
+                    } else {
+                        None
+                    };
+
                     *guard = InternalRoomState::SelectChart;
                     drop(guard);
-                    // TODO print results
+
+                    if let (Some(sender), Some(content)) = (sender.as_ref(), content) {
+                        self.send_as(sender, content).await;
+                    }
                     self.send(Message::GameEnd).await;
                     // dbg!(2);
                     // dbg!(3);
@@ -412,12 +504,14 @@ impl Room {
                             .map(|it| (it + 1) % users.len())
                             .unwrap_or_default();
                         let new_host = &users[index];
-                        *self.host.write().await = Arc::downgrade(new_host);
-                        self.send(Message::NewHost { user: new_host.id }).await;
-                        if let Some(old) = host.upgrade() {
-                            old.try_send(ServerCommand::ChangeHost(false)).await;
+                        if !host.ptr_eq(&Arc::downgrade(new_host)) {
+                            *self.host.write().await = Arc::downgrade(new_host);
+                            self.send(Message::NewHost { user: new_host.id }).await;
+                            if let Some(old) = host.upgrade() {
+                                old.try_send(ServerCommand::ChangeHost(false)).await;
+                            }
+                            new_host.try_send(ServerCommand::ChangeHost(true)).await;
                         }
-                        new_host.try_send(ServerCommand::ChangeHost(true)).await;
                     }
                     self.on_state_change().await;
                 }

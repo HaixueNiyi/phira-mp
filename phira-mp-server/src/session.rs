@@ -147,10 +147,17 @@ impl User {
         let room = guard.as_ref().map(Arc::clone);
         drop(guard);
         if let Some(room) = room {
-            let guard = room.state.read().await;
-            let is_playing = matches!(*guard, InternalRoomState::Playing { .. });
-            drop(guard);
-            if is_playing {
+            let is_playing_unfinished = {
+                let guard = room.state.read().await;
+                if let InternalRoomState::Playing { results, aborted } = &*guard {
+                    !self.monitor.load(Ordering::SeqCst)
+                        && !results.contains_key(&self.id)
+                        && !aborted.contains(&self.id)
+                } else {
+                    false
+                }
+            };
+            if is_playing_unfinished {
                 warn!(user = self.id, "lost connection on playing, aborting");
                 let aborted = {
                     let mut users_guard = self.server.users.write().await;
@@ -1779,21 +1786,6 @@ mod tests {
         *p2.room.write().await = Some(Arc::clone(&room));
         *mon.room.write().await = Some(Arc::clone(&room));
 
-        let make_rec = |rec_id, player| Record {
-            id: rec_id,
-            player,
-            score: 900_000,
-            perfect: 100,
-            good: 0,
-            bad: 0,
-            miss: 0,
-            max_combo: 100,
-            accuracy: 1.0,
-            full_combo: true,
-            std: 0.0,
-            std_score: 0.0,
-        };
-
         // Wrong state (SelectChart) rejected.
         assert!(
             apply_played_record(&p1, &room, make_rec(501, 1))
@@ -1940,5 +1932,147 @@ mod tests {
                 other => panic!("unexpected command {other:?}"),
             }
         }
+    }
+
+    fn make_rec(rec_id: i32, player: i32) -> Record {
+        Record {
+            id: rec_id,
+            player,
+            score: 900_000,
+            perfect: 100,
+            good: 0,
+            bad: 0,
+            miss: 0,
+            max_combo: 100,
+            accuracy: 1.0,
+            full_combo: true,
+            std: 0.0,
+            std_score: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn ranking_uses_current_host_and_preserves_finished_leaver_score() {
+        let (state, _lost_rx) = dummy_state();
+        let (p1, _p1_cli, _p1_rx) = connect_client_pair(&state, 1, "p1").await;
+        let (p2, _p2_cli, mut p2_rx) = connect_client_pair(&state, 2, "p2").await;
+
+        // p1 is first in room.users, while p2 is the current host.
+        let rid: phira_mp_common::RoomId = "rank-host".to_owned().try_into().unwrap();
+        let room = Arc::new(Room::new(rid.clone(), Arc::downgrade(&p1)));
+        *p1.room.write().await = Some(Arc::clone(&room));
+        assert_eq!(
+            room.add_user(Arc::downgrade(&p2), false).await,
+            AddUserResult::Added
+        );
+        *p2.room.write().await = Some(Arc::clone(&room));
+        *room.host.write().await = Arc::downgrade(&p2);
+        room.cycle.store(true, Ordering::SeqCst);
+        *room.chart.write().await = Some(crate::Chart {
+            id: 1,
+            name: "c".to_owned(),
+        });
+
+        assert!(matches!(
+            process(Arc::clone(&p2), ClientCommand::RequestStart).await,
+            Some(ServerCommand::RequestStart(Ok(())))
+        ));
+        assert!(matches!(
+            process(Arc::clone(&p1), ClientCommand::Ready).await,
+            Some(ServerCommand::Ready(Ok(())))
+        ));
+        assert!(matches!(
+            *room.state.read().await,
+            InternalRoomState::Playing { .. }
+        ));
+
+        // p1 finishes and uploads record, then leaves before p2 finishes.
+        let mut rec1 = make_rec(601, 1);
+        rec1.score = 950_000;
+        rec1.accuracy = 0.99;
+        assert!(apply_played_record(&p1, &room, rec1).await.is_ok());
+        assert!(!room.on_user_leave(&p1).await);
+
+        // Drain earlier broadcasts on p2_rx.
+        while p2_rx.try_recv().is_ok() {}
+
+        // p2 finishes; ranking Chat must be sent as p2 (the host), not p1, and retain p1's score.
+        let mut rec2 = make_rec(602, 2);
+        rec2.score = 900_000;
+        rec2.accuracy = 0.95;
+        assert!(apply_played_record(&p2, &room, rec2).await.is_ok());
+
+        let mut chat_msg = None;
+        while let Ok(Some(cmd)) = time::timeout(Duration::from_millis(50), p2_rx.recv()).await {
+            if let ServerCommand::Message(Message::Chat { user, content }) = cmd {
+                chat_msg = Some((user, content));
+                break;
+            }
+        }
+        let (sender_id, content) = chat_msg.expect("expected ranking Chat message");
+        assert_eq!(sender_id, 2, "ranking Chat must be sent as current host p2");
+        assert!(content.starts_with("本局房主\n本局排名："));
+        assert!(
+            content.contains("p1  0950000"),
+            "finished leaver score missing: {content}"
+        );
+        assert!(
+            content.contains("p2  0900000"),
+            "host score missing: {content}"
+        );
+        assert!(
+            !content.contains("放弃："),
+            "finished leaver falsely marked aborted: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_player_dangle_gets_grace_period_during_playing() {
+        let (state, _lost_rx) = dummy_state();
+        let p1 = Arc::new(User::new(
+            21,
+            "p1".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        let p2 = Arc::new(User::new(
+            22,
+            "p2".to_owned(),
+            Language::default(),
+            Arc::clone(&state),
+        ));
+        state.users.write().await.insert(21, Arc::clone(&p1));
+        state.users.write().await.insert(22, Arc::clone(&p2));
+
+        let rid: phira_mp_common::RoomId = "dangle-play".to_owned().try_into().unwrap();
+        let room = Arc::new(Room::new(rid.clone(), Arc::downgrade(&p1)));
+        *p1.room.write().await = Some(Arc::clone(&room));
+        assert_eq!(
+            room.add_user(Arc::downgrade(&p2), false).await,
+            AddUserResult::Added
+        );
+        *p2.room.write().await = Some(Arc::clone(&room));
+        state.rooms.write().await.insert(rid, Arc::clone(&room));
+
+        let mut results = std::collections::HashMap::new();
+        results.insert(21, make_rec(701, 21));
+        *room.state.write().await = InternalRoomState::Playing {
+            results,
+            aborted: HashSet::new(),
+        };
+
+        // p1 already finished, so disconnecting gets the grace period instead of immediate kick.
+        Arc::clone(&p1)
+            .dangle_with_delay(None, Duration::from_millis(120))
+            .await;
+        assert!(state.users.read().await.contains_key(&21));
+        assert!(room.contains_user(21).await);
+
+        // p2 has not finished yet, so disconnecting aborts immediately.
+        Arc::clone(&p2)
+            .dangle_with_delay(None, Duration::from_millis(120))
+            .await;
+        assert!(!state.users.read().await.contains_key(&22));
+        assert!(!room.contains_user(22).await);
     }
 }

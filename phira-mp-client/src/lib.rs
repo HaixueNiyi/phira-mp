@@ -84,6 +84,7 @@ struct State {
     cb_abort: RCallback<()>,
 
     live_players: DashMap<i32, Arc<LivePlayer>>,
+    known_users: DashMap<i32, String>,
     messages: Mutex<Vec<Message>>,
     pending_create_id: Mutex<Option<RoomId>>,
     pending_join_id: Mutex<Option<RoomId>>,
@@ -136,6 +137,7 @@ impl Client {
             cb_abort: CallbackSlot::default(),
 
             live_players: DashMap::new(),
+            known_users: DashMap::new(),
             messages: Mutex::default(),
             pending_create_id: Mutex::default(),
             pending_join_id: Mutex::default(),
@@ -221,11 +223,13 @@ impl Client {
 
     /// Must not be called from within a Tokio runtime worker thread.
     pub fn user_name_opt(&self, id: i32) -> Option<String> {
-        self.state
+        let in_room = self
+            .state
             .room
             .blocking_read()
             .as_ref()
-            .and_then(|it| it.users.get(&id).map(|it| it.name.clone()))
+            .and_then(|it| it.users.get(&id).map(|it| it.name.clone()));
+        in_room.or_else(|| self.state.known_users.get(&id).map(|it| it.value().clone()))
     }
 
     /// Must not be called from within a Tokio runtime worker thread.
@@ -497,6 +501,13 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
                     *state.me.write().await = Some(me.clone());
                     *state.room.write().await = room.clone();
                     state.live_players.clear();
+                    state.known_users.clear();
+                    state.known_users.insert(me.id, me.name.clone());
+                    if let Some(room) = &room {
+                        for (id, user) in &room.users {
+                            state.known_users.insert(*id, user.name.clone());
+                        }
+                    }
                     Ok((me, room))
                 }
                 Err(err) => Err(err),
@@ -523,21 +534,25 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
                 .extend(judges.iter().cloned());
         }
         ServerCommand::Message(msg) => {
-            match msg {
+            match &msg {
                 Message::LockRoom { lock } => {
                     if let Some(room) = state.room.write().await.as_mut() {
-                        room.locked = lock;
+                        room.locked = *lock;
                     }
                 }
                 Message::CycleRoom { cycle } => {
                     if let Some(room) = state.room.write().await.as_mut() {
-                        room.cycle = cycle;
+                        room.cycle = *cycle;
                     }
                 }
-                Message::LeaveRoom { user, .. } => {
-                    state.live_players.remove(&user);
+                Message::JoinRoom { user, name } => {
+                    state.known_users.insert(*user, name.clone());
+                }
+                Message::LeaveRoom { user, name } => {
+                    state.known_users.insert(*user, name.clone());
+                    state.live_players.remove(user);
                     if let Some(room) = state.room.write().await.as_mut() {
-                        room.users.remove(&user);
+                        room.users.remove(user);
                     }
                 }
                 _ => {}
@@ -570,6 +585,8 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
                     match (id, me) {
                         (Some(id), Some(me)) => {
                             state.live_players.clear();
+                            state.known_users.clear();
+                            state.known_users.insert(me.id, me.name.clone());
                             *state.room.write().await = Some(ClientRoomState {
                                 id,
                                 state: RoomState::default(),
@@ -598,6 +615,10 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
                 Ok(resp) => {
                     if let Some(id) = state.pending_join_id.lock().await.take() {
                         state.live_players.clear();
+                        state.known_users.clear();
+                        for user in &resp.users {
+                            state.known_users.insert(user.id, user.name.clone());
+                        }
                         *state.room.write().await = Some(ClientRoomState {
                             id,
                             state: resp.state,
@@ -623,6 +644,7 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
         ServerCommand::OnJoinRoom(user) => {
             if let Some(room) = state.room.write().await.as_mut() {
                 room.live |= user.monitor;
+                state.known_users.insert(user.id, user.name.clone());
                 room.users.insert(user.id, user);
             }
         }
@@ -630,6 +652,7 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
             if res.is_ok() {
                 *state.room.write().await = None;
                 state.live_players.clear();
+                state.known_users.clear();
             }
             cb(&state.cb_leave_room, res).await;
         }
@@ -776,6 +799,99 @@ mod tests {
         client.leave_room().await.unwrap();
         assert!(client.state.room.read().await.is_none());
         assert!(client.state.live_players.is_empty());
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn client_preserves_departed_user_name_until_room_left() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _srv_stream = Stream::<ServerCommand, ClientCommand>::new(
+                None,
+                sock,
+                Box::new(|send_tx, cmd| async move {
+                    match cmd {
+                        ClientCommand::Authenticate { .. } => {
+                            let me = UserInfo {
+                                id: 1,
+                                name: "alice".to_owned(),
+                                monitor: false,
+                            };
+                            let _ = send_tx
+                                .send(ServerCommand::Authenticate(Ok((me, None))))
+                                .await;
+                        }
+                        ClientCommand::JoinRoom { .. } => {
+                            let me = UserInfo {
+                                id: 1,
+                                name: "alice".to_owned(),
+                                monitor: false,
+                            };
+                            let bob = UserInfo {
+                                id: 2,
+                                name: "bob".to_owned(),
+                                monitor: false,
+                            };
+                            let resp = JoinRoomResponse {
+                                state: RoomState::default(),
+                                users: vec![me, bob],
+                                live: false,
+                            };
+                            let _ = send_tx.send(ServerCommand::JoinRoom(Ok(resp))).await;
+                            let _ = send_tx
+                                .send(ServerCommand::Message(Message::LeaveRoom {
+                                    user: 2,
+                                    name: "bob".to_owned(),
+                                }))
+                                .await;
+                        }
+                        ClientCommand::LeaveRoom => {
+                            let _ = send_tx.send(ServerCommand::LeaveRoom(Ok(()))).await;
+                        }
+                        _ => {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let client = Arc::new(Client::from_address(&addr.to_string()).await.unwrap());
+        client.authenticate("test-token").await.unwrap();
+        let rid: RoomId = "name-cache".to_owned().try_into().unwrap();
+        client.join_room(rid, false).await.unwrap();
+
+        time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Some(room) = client.state.room.read().await.as_ref()
+                    && !room.users.contains_key(&2)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("bob did not leave room in time");
+
+        let client_for_name = Arc::clone(&client);
+        let name = tokio::task::spawn_blocking(move || client_for_name.user_name(2))
+            .await
+            .unwrap();
+        assert_eq!(name, "bob");
+
+        client.leave_room().await.unwrap();
+        let client_for_clear = Arc::clone(&client);
+        let cleared = tokio::task::spawn_blocking(move || client_for_clear.user_name_opt(2))
+            .await
+            .unwrap();
+        assert_eq!(cleared, None);
 
         drop(client);
         server_task.abort();
