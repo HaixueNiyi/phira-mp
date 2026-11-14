@@ -15,18 +15,18 @@
 #### Dependent
 You will need `git`, `curl`, and Rust 1.88+ (`rustup`: https://www.rust-lang.org/tools/install).
 
-For Ubuntu or Debian users, install `curl` and `git` with:
+For Ubuntu or Debian users, install `curl`, `git`, and the C build toolchain with:
 
 ```shell
-sudo apt install curl git
+sudo apt install curl git build-essential
 ```
 For Fedora or CentOS users, use the following command:
 ```shell
-sudo yum install curl git
+sudo dnf install curl git gcc
 ```
-For Arch Linux users, install `curl` and `git` (or install Rust directly via `sudo pacman -S --needed rustup git && rustup default stable`):
+For Arch Linux users, install `curl`, `git`, and `base-devel` (or install Rust directly via `sudo pacman -S --needed rustup git base-devel && rustup default stable`):
 ```shell
-sudo pacman -S --needed curl git
+sudo pacman -S --needed curl git base-devel
 ```
 After `curl` is installed, install Rust with the following command (skip if you already installed it via `rustup` above):
 ```shell

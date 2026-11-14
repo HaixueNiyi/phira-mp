@@ -12,18 +12,18 @@
 #### 依赖
 需要 `git`、`curl` 与 Rust 1.88 或更高版本（可通过 `rustup` 安装：https://www.rust-lang.org/tools/install ）。
 
-对于 Ubuntu 或 Debian 用户，可使用以下命令安装 `curl` 与 `git`：
+对于 Ubuntu 或 Debian 用户，可使用以下命令安装 `curl`、`git` 与 C 编译工具链：
 
 ```shell
-sudo apt install curl git
+sudo apt install curl git build-essential
 ```
 对于 Fedora 或 CentOS 用户，请使用以下命令：
 ```shell
-sudo yum install curl git
+sudo dnf install curl git gcc
 ```
-对于 Arch Linux 用户，可使用以下命令安装 `curl` 与 `git`（也可以直接运行 `sudo pacman -S --needed rustup git && rustup default stable`）：
+对于 Arch Linux 用户，可使用以下命令安装 `curl`、`git` 与 `base-devel`（也可以直接运行 `sudo pacman -S --needed rustup git base-devel && rustup default stable`）：
 ```shell
-sudo pacman -S --needed curl git
+sudo pacman -S --needed curl git base-devel
 ```
 安装 `curl` 后，使用以下命令安装 Rust（若上面已通过 `rustup` 安装则可跳过）：
 ```shell
@@ -48,7 +48,7 @@ RUST_LOG=info target/release/phira-mp-server --bind 0.0.0.0 --port 8080
 
 日志文件写入 `./log/`（按小时滚动）。可用 `--log-level <off|error|warn|info|debug|trace>`（默认 `debug`）控制写入文件的日志级别，用 `--log-max-files <N>`（默认 `168`，即一周；`0` 表示不清理）限制保留的日志文件数量。
 
-### For docker
+### 使用 Docker
 
 1. 创建 Dockerfile
 ```
